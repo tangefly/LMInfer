@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lminfer"
+version = "0.1.0"
+description = "A naive LLM inference server built on transformers, with vLLM-style CLI and OpenAI-compatible HTTP API. For KV cache theory study."
+requires-python = ">=3.10"
+dependencies = [
+    "transformers>=4.49",
+    "torch>=2.0",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.scripts]
+# 安装后可直接使用 `lminfer serve --model ...` 命令(类似 vllm serve)
+lminfer = "lminfer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lminfer*"]

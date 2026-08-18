@@ -1,0 +1,5 @@
+transformers>=4.49
+torch>=2.0
+fastapi
+uvicorn
+requests        # 仅 examples/ 与 bench 使用
