@@ -19,7 +19,8 @@ from fastapi.responses import StreamingResponse
 
 from .config import EngineConfig, SamplingParams
 from .engine import GenerationResult, LLMEngine
-from .schemas import ChatCompletionRequest, CompletionRequest
+from .schemas import ChatCompletionRequest, ChatMessage, CompletionRequest
+from .toolcalls import ToolCallStreamSplitter, clean_content, parse_tool_calls
 
 STREAM_HEADERS = {
     "Cache-Control": "no-cache",       # SSE 要求不缓存
@@ -52,22 +53,57 @@ def create_app(engine: LLMEngine) -> FastAPI:
     def _sse(obj: dict) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    async def _chat_streamer(req_id: str, queue: asyncio.Queue):
-        """chat 流式响应生成器: role 分片 -> 文本分片 -> 结束分片 -> [DONE]."""
+    def _tool_call_delta(call: dict, index: int) -> dict:
+        """把一个工具调用变成流式 delta 分片(OpenAI 流式格式)."""
+        return {
+            "index": index,
+            "id": call["id"],
+            "type": "function",
+            "function": {"name": call["function"]["name"],
+                         "arguments": call["function"]["arguments"]},
+        }
+
+    async def _chat_streamer(req_id: str, queue: asyncio.Queue,
+                             splitter: ToolCallStreamSplitter | None = None):
+        """chat 流式响应生成器: role 分片 -> 文本分片 -> 结束分片 -> [DONE].
+
+        带 splitter 时(请求带 tools): <tool_call> 块不进入 content, 解析后
+        以 tool_calls delta 发出, finish_reason 为 "tool_calls".
+        """
         base = _base(f"chatcmpl-{req_id}")
-        yield _sse({**base, "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+
+        def _chunk(delta: dict, finish_reason: str | None) -> str:
+            return _sse({**base, "object": "chat.completion.chunk",
+                         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]})
+
+        def _emit(events):
+            """把 splitter 事件变成响应分片, 返回发出的工具调用个数."""
+            nonlocal call_index
+            for ev_kind, ev_payload in events:
+                if ev_kind == "content":
+                    yield _chunk({"content": ev_payload}, None)
+                else:
+                    yield _chunk({"tool_calls": [_tool_call_delta(ev_payload, call_index)]}, None)
+                    call_index += 1
+
+        call_index = 0
+        yield _chunk({"role": "assistant"}, None)
         while True:
             kind, payload = await queue.get()
             if kind == "done":
                 r: GenerationResult = payload
-                yield _sse({**base, "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": r.finish_reason}],
-                            "usage": _usage(r)})
+                if splitter is not None:
+                    for chunk in _emit(splitter.flush()):
+                        yield chunk
+                finish = "tool_calls" if call_index else r.finish_reason
+                yield _chunk({}, finish)
                 yield "data: [DONE]\n\n"
                 return
-            yield _sse({**base, "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": payload}, "finish_reason": None}]})
+            if splitter is None:
+                yield _chunk({"content": payload}, None)
+            else:
+                for chunk in _emit(splitter.push(payload)):
+                    yield chunk
 
     async def _completion_streamer(req_id: str, queue: asyncio.Queue):
         """completions 流式响应生成器."""
@@ -83,6 +119,24 @@ def create_app(engine: LLMEngine) -> FastAPI:
                 return
             yield _sse({**base, "object": "text_completion",
                         "choices": [{"index": 0, "text": payload, "finish_reason": None}]})
+
+    def _message_dicts(messages: list[ChatMessage]) -> list[dict]:
+        """pydantic 消息转纯 dict, 交给 chat template 渲染.
+
+        模板里既可能写 message['role'] 也可能写 message.role(jinja 的 `.` 对 dict
+        会回退到下标访问, 对 pydantic 对象则只支持属性访问), 统一转 dict 才能
+        适配任意模板; tool_calls / tool_call_id / content(null) 原样透传,
+        不遗漏客户端 post 过来的工具调用字段.
+        """
+        out = []
+        for m in messages:
+            d = {"role": m.role, "content": m.content}
+            if m.tool_calls is not None:
+                d["tool_calls"] = m.tool_calls
+            if m.tool_call_id is not None:
+                d["tool_call_id"] = m.tool_call_id
+            out.append(d)
+        return out
 
     def _check_model(model_field: str | None) -> None:
         """请求里的 model 若与当前加载模型不一致则报错(与 vLLM 行为一致)."""
@@ -142,13 +196,20 @@ def create_app(engine: LLMEngine) -> FastAPI:
         if engine.tokenizer.chat_template is None:
             raise HTTPException(400, "当前模型没有 chat template, 请改用 /v1/completions")
 
+        # tool_choice="none" 时不渲染工具; 其余情况(缺省/auto/required/指定工具)一律自动
+        tools = req.tools if (req.tools and req.tool_choice != "none") else None
+        # 只有渲染了工具才需要解析 <tool_call> 输出(此时保留特殊 token 供解析)
+        parse_tools = bool(tools) and engine.config.tool_call_parser != "none"
+
         # 用 transformers 的 chat template 把消息列表渲染成 prompt(与参考脚本一致)
         kwargs = {"add_generation_prompt": True, "tokenize": True}
+        if tools is not None:
+            kwargs["tools"] = tools
         if engine.config.enable_thinking is not None:
             kwargs["enable_thinking"] = engine.config.enable_thinking
         try:
-            ids = engine.tokenizer.apply_chat_template(req.messages, **kwargs)
-        except Exception as e:  # 模板缺参数等
+            ids = engine.tokenizer.apply_chat_template(_message_dicts(req.messages), **kwargs)
+        except Exception as e:  # 模板缺参数、模板不支持 tools 等
             raise HTTPException(400, f"chat template 渲染失败: {e}")
         if hasattr(ids, "input_ids"):  # transformers 5.x 返回 tokenizers.Encoding
             ids = ids.input_ids
@@ -158,14 +219,25 @@ def create_app(engine: LLMEngine) -> FastAPI:
         req_id = uuid.uuid4().hex[:12]
 
         if req.stream:
-            queue = await engine.generate(req_id, prompt_ids, sampling, stream=True)
-            return StreamingResponse(_chat_streamer(req_id, queue),
+            splitter = ToolCallStreamSplitter() if parse_tools else None
+            queue = await engine.generate(req_id, prompt_ids, sampling, stream=True,
+                                          skip_special_tokens=not parse_tools)
+            return StreamingResponse(_chat_streamer(req_id, queue, splitter),
                                      media_type="text/event-stream", headers=STREAM_HEADERS)
 
-        r = await engine.generate(req_id, prompt_ids, sampling)
+        r = await engine.generate(req_id, prompt_ids, sampling,
+                                  skip_special_tokens=not parse_tools)
+        if parse_tools:
+            tool_calls = parse_tool_calls(r.output_text)
+            content = clean_content(r.output_text) or None
+        else:
+            tool_calls, content = [], r.output_text
+        message: dict = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         return {**_base(f"chatcmpl-{req_id}"), "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": r.output_text},
-                             "finish_reason": r.finish_reason}],
+                "choices": [{"index": 0, "message": message,
+                             "finish_reason": "tool_calls" if tool_calls else r.finish_reason}],
                 "usage": _usage(r)}
 
     @app.get("/v1/stats")

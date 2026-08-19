@@ -14,11 +14,14 @@ class EngineConfig:
     model: str                      # 模型路径或 HF 上的模型名
     dtype: str = "auto"             # auto / bfloat16 / float16 / float32
     device_map: str = "auto"        # 模型放置方式, 与参考脚本一致
+    attn_implementation: str = "auto"  # auto / eager / sdpa / flash_attention_2(需安装 flash-attn)
     max_model_len: int = 4096       # 单序列最大总长度(prompt + 生成部分)
     max_num_seqs: int = 4           # 最大并发请求数(朴素并发 = 线程池大小)
+    served_model_name: str | None = None  # 对外暴露的模型名(vLLM 的 --served-model-name)
     trust_remote_code: bool = False  # 允许执行远程模型代码(个别模型需要)
     disable_log_stats: bool = False  # 关闭每请求统计日志
     enable_thinking: bool | None = None  # Qwen3 等模型的 thinking 开关, None 表示不传
+    tool_call_parser: str = "auto"  # auto/qwen: 解析 <tool_call> 块; none: 关闭(对应 vLLM 的 --tool-call-parser)
 
 
 @dataclass

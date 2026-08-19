@@ -51,13 +51,18 @@ LMInfer/
 ```bash
 pip install -e .
 
-# 启动服务(类似 vllm serve)
-lminfer serve --model /home/tanger/workspace/models/Qwen2.5-7B-Instruct \
-              --port 8000 --max-num-seqs 4
+# 启动服务(两种写法都与 vLLM 一致: 位置参数 或 --model)
+lminfer serve /home/tanger/workspace/models/Qwen2.5-7B-Instruct --port 8000
+lminfer serve --model /home/tanger/workspace/models/Qwen3-0.6B --max-num-seqs 4
 
 # 也可以不带参数安装直接运行
-python -m lminfer serve --model /home/tanger/workspace/models/Qwen3-0.6B
+python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 ```
+
+`--served-model-name` 与 vLLM 语义一致（覆盖对外暴露的模型名）；
+`--gpu-memory-utilization`、`--tensor-parallel-size`、`--kv-transfer-config`、
+`--enable-auto-tool-choice`、`--tool-call-parser` 等参数会被接受，
+但朴素实现中不生效（启动时会打印 WARNING 说明原因）。
 
 验证服务：
 

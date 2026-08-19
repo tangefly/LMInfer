@@ -9,7 +9,9 @@ from .config import SamplingParams
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str
+    content: str | None = None            # assistant 工具调用消息为 null, 与 OpenAI 一致
+    tool_calls: list[dict] | None = None  # assistant 消息: OpenAI 格式的工具调用列表
+    tool_call_id: str | None = None       # tool 消息: 关联的 assistant 工具调用 id
 
 
 class _SamplingFields(BaseModel):
@@ -58,3 +60,6 @@ class ChatCompletionRequest(_SamplingFields):
 
     model: str | None = None
     messages: list[ChatMessage]
+    tools: list[dict] | None = None      # OpenAI 函数 schema 列表, 渲染进 chat template
+    tool_choice: str | dict | None = None  # "auto"/"none"/"required" 或 {"type":"function",...}
+

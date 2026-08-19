@@ -96,17 +96,28 @@ class LLMEngine:
             # 与 vLLM 相同: 无 pad token 的模型用 eos token 兜底
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # attn_implementation: "auto" 传 None, 让 transformers 用默认(sdpa);
+        # 显式指定(如 flash_attention_2)则透传, 未安装 flash-attn 时由 transformers 回退 kernels 或报错
+        attn_impl = None if self.config.attn_implementation == "auto" else self.config.attn_implementation
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model,
             torch_dtype=dtype_map[self.config.dtype],
             device_map=self.config.device_map,
             trust_remote_code=self.config.trust_remote_code,
+            attn_implementation=attn_impl,
         )
         self.model.eval()
         self.model.requires_grad_(False)
-        self.model_name = self.config.model.rstrip("/").split("/")[-1] or self.config.model
+        # 对外模型名: 优先用 --served-model-name(与 vLLM 语义一致), 否则取路径最后一段
+        self.model_name = (self.config.served_model_name
+                           or self.config.model.rstrip("/").split("/")[-1]
+                           or self.config.model)
 
-        logger.info("模型加载完成: %s (%.2fs)", self.model_name, time.time() - t0)
+        # 打印实际解析出的 attention 实现(transformers 会把 auto/回退解析为具体值)
+        resolved_impl = (getattr(self.model.config, "_attn_implementation_internal", None)
+                         or self.model.config._attn_implementation or "auto")
+        logger.info("模型加载完成: %s (%.2fs), attention 实现: %s",
+                    self.model_name, time.time() - t0, resolved_impl)
         logger.info("KV cache 每 token 占用(理论): %.2f MiB", self.kv_bytes_per_token / (1024 ** 2))
 
     @property
@@ -171,6 +182,7 @@ class LLMEngine:
         sampling: SamplingParams,
         use_kv_cache: bool = True,         # False 仅用于理论对比实验
         on_token: Callable[[int], None] | None = None,  # 每生成一个 token 回调(流式输出用)
+        skip_special_tokens: bool = True,  # False 用于工具调用: 保留 <tool_call> 等标记供解析
     ) -> GenerationResult:
         """prefill + decode 的生成循环, 返回完整结果.
 
@@ -234,15 +246,15 @@ class LLMEngine:
                     )
 
                 token = self._sample(out.logits[:, -1, :], all_ids, sampling)
+                if token in eos_ids:
+                    # eos 不入输出(与 vLLM 一致); 先检查再回调, 流式也不会漏出
+                    finish_reason = "stop"
+                    break
                 _on_token(token)
                 all_ids = torch.cat([all_ids, torch.tensor([[token]], device=self.model.device)], dim=-1)
 
-                if token in eos_ids:
-                    finish_reason = "stop"
-                    break
-
                 # 朴素 stop 检查: 每步重解出全部文本并找子串(简单但 O(n), 足够教学)
-                text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                text = self.tokenizer.decode(generated, skip_special_tokens=skip_special_tokens)
                 stopped = next((s for s in sampling.stop if s in text), None)
                 if stopped is not None:
                     finish_reason = "stop"
@@ -253,7 +265,10 @@ class LLMEngine:
                 finish_reason = "length"
 
             if output_text is None:
-                output_text = self.tokenizer.decode(generated, skip_special_tokens=True)
+                # 兜底: prefill 首 token 即 eos 的极端情况, 同样不入输出
+                while generated and generated[-1] in eos_ids:
+                    generated.pop()
+                output_text = self.tokenizer.decode(generated, skip_special_tokens=skip_special_tokens)
 
         # ---- 统计 ----
         total_ms = (time.perf_counter() - t0) * 1000
@@ -288,7 +303,8 @@ class LLMEngine:
     # 异步(HTTP)入口
     # ------------------------------------------------------------------
     async def generate(self, request_id: str | None, prompt_ids: torch.Tensor,
-                       sampling: SamplingParams, stream: bool = False):
+                       sampling: SamplingParams, stream: bool = False,
+                       skip_special_tokens: bool = True):
         """异步生成.
 
         返回:
@@ -304,12 +320,15 @@ class LLMEngine:
 
             def on_token(tok: int):
                 # 在 worker 线程里把 token 解码成文本, 再安全塞回事件循环
-                text = self.tokenizer.decode(tok, skip_special_tokens=True)
+                text = self.tokenizer.decode(tok, skip_special_tokens=skip_special_tokens)
                 loop.call_soon_threadsafe(queue.put_nowait, ("text", text))
 
             fut = loop.run_in_executor(
                 self.executor,
-                functools.partial(self._generate, request_id, prompt_ids, sampling, True, on_token),
+                functools.partial(
+                    self._generate, request_id, prompt_ids, sampling, True, on_token,
+                    skip_special_tokens,
+                ),
             )
 
             async def _finish():
@@ -323,7 +342,10 @@ class LLMEngine:
         result = await asyncio.wrap_future(
             loop.run_in_executor(
                 self.executor,
-                functools.partial(self._generate, request_id, prompt_ids, sampling, True, None),
+                functools.partial(
+                    self._generate, request_id, prompt_ids, sampling, True, None,
+                    skip_special_tokens,
+                ),
             )
         )
         return result
