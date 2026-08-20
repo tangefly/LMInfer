@@ -23,6 +23,94 @@ TOOL_CALL_BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 THINK_START, THINK_END = "<think>", "</think>"
 
 
+def _match_json_value(text: str, start: int) -> str | None:
+    """从 start 处取一个完整 JSON 值的原始子串(对象/数组/字符串/标量)."""
+    if start >= len(text):
+        return None
+    c = text[start]
+    if c in "{[":
+        close = "}" if c == "{" else "]"
+        depth, in_str = 0, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if ch == "\\":
+                    continue
+                if ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == c:
+                depth += 1
+            elif ch == close:
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        return None
+    if c == '"':
+        i = start + 1
+        while i < len(text):
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == '"':
+                return text[start:i + 1]
+            i += 1
+        return None
+    # 标量(数字/true/false/null): 到逗号或右括号为止
+    i = start
+    while i < len(text) and text[i] not in ",}":
+        i += 1
+    return text[start:i].strip() or None
+
+
+def _extract_raw_arguments(block: str) -> str | None:
+    """提取块内顶层 "arguments" 键的原始 JSON 值子串(round-trip 保真用).
+
+    模型原始生成的 arguments(如 {"city":"Shanghai"} 紧凑格式)经 json.loads +
+    json.dumps 会被归一化补空格; 客户端把 assistant 消息原样回传时, 模板按
+    is string 分支原样渲染原始子串, 才能与生成流逐位一致, KV 前缀复用才
+    不会断在 <tool_call> 块。提取失败返回 None(调用方回退重序列化).
+    """
+    depth = 0      # 0 = 根对象外, 1 = 根对象内
+    in_str = False
+    i, n = 0, len(block)
+    while i < n:
+        c = block[i]
+        if in_str:
+            i += 2 if (c == "\\" and i + 1 < n) else 1
+            if c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            if depth == 1:
+                # 根对象内的字符串: 先判断是键还是值(键后紧跟冒号)
+                j = i + 1
+                while j < n and block[j] != '"':
+                    j += 2 if block[j] == "\\" else 1
+                if j < n:
+                    k = j + 1
+                    while k < n and block[k] in " \t\r\n":
+                        k += 1
+                    if k < n and block[k] == ":" and block[i + 1:j] == "arguments":
+                        k += 1
+                        while k < n and block[k] in " \t\r\n":
+                            k += 1
+                        return _match_json_value(block, k) if k < n else None
+                i = j + 1
+            else:
+                in_str = True
+                i += 1
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    return None
+
+
 def _parse_call_block(block: str) -> Dict[str, Any] | None:
     """把一个 <tool_call> 块内的 JSON 解析成 OpenAI 工具调用, 失败返回 None."""
     try:
@@ -40,10 +128,19 @@ def _parse_call_block(block: str) -> Dict[str, Any] | None:
             args = {}
     if not isinstance(args, dict):
         args = {}
+    # 优先返回原始 JSON 子串(保真 round-trip), 提取失败才回退重序列化
+    raw_args = _extract_raw_arguments(block)
+    if raw_args is not None:
+        try:
+            json.loads(raw_args)
+        except json.JSONDecodeError:
+            raw_args = None
+    if raw_args is None:
+        raw_args = json.dumps(args, ensure_ascii=False)
     return {
         "id": f"call_{uuid.uuid4().hex[:16]}",
         "type": "function",
-        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        "function": {"name": name, "arguments": raw_args},
     }
 
 

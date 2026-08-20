@@ -4,14 +4,17 @@
   GET  /health               健康检查(200 = 可用)
   GET  /v1/models            模型列表
   POST /v1/completions       文本补全(支持 stream)
-  POST /v1/chat/completions  对话补全(支持 stream)
+  POST /v1/chat/completions  对话补全(支持 stream, 支持 agent 模式)
+  GET  /v1/agent/sessions    agent 模式会话列表(朴素实现额外提供的接口)
   GET  /v1/stats             运行时统计(朴素实现额外提供的接口)
 """
 
 import asyncio
 import json
+import logging
 import time
 import uuid
+from typing import Callable
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -19,8 +22,12 @@ from fastapi.responses import StreamingResponse
 
 from .config import EngineConfig, SamplingParams
 from .engine import GenerationResult, LLMEngine
+from .kvcache import KIND_MAIN, KIND_SUB, SessionKVStore
 from .schemas import ChatCompletionRequest, ChatMessage, CompletionRequest
+from .sessions import AgentSessionRegistry
 from .toolcalls import ToolCallStreamSplitter, clean_content, parse_tool_calls
+
+logger = logging.getLogger("lminfer")
 
 STREAM_HEADERS = {
     "Cache-Control": "no-cache",       # SSE 要求不缓存
@@ -36,6 +43,12 @@ def create_app(engine: LLMEngine) -> FastAPI:
         description="基于 transformers 的朴素推理服务(学习 KV Cache 用), OpenAI 兼容接口",
         version="0.1.0",
     )
+
+    # agent 模式会话注册表(服务层状态; handler 都在事件循环上执行, 无需加锁)
+    agent_sessions = AgentSessionRegistry()
+    # 跨请求前缀 KV 复用存储(仅 --reuse-agent-kv / --reuse-agent-kv-append 时使用, 见 kvcache.py)
+    kv_store = SessionKVStore(config=engine.model.config,
+                              idle_ttl=engine.config.kv_segment_idle_ttl)
 
     # ------------------------------------------------------------------
     # 辅助函数: 构造 OpenAI 格式响应
@@ -64,13 +77,17 @@ def create_app(engine: LLMEngine) -> FastAPI:
         }
 
     async def _chat_streamer(req_id: str, queue: asyncio.Queue,
-                             splitter: ToolCallStreamSplitter | None = None):
+                             splitter: ToolCallStreamSplitter | None = None,
+                             extra: dict | None = None,
+                             on_done: Callable[[GenerationResult], None] | None = None):
         """chat 流式响应生成器: role 分片 -> 文本分片 -> 结束分片 -> [DONE].
 
         带 splitter 时(请求带 tools): <tool_call> 块不进入 content, 解析后
         以 tool_calls delta 发出, finish_reason 为 "tool_calls".
+        extra: agent 模式时追加到每个 chunk 顶层的字段(session_id/trace),
+        客户端从首个 chunk 就能拿到; on_done: 生成结束时回调(累计会话用量).
         """
-        base = _base(f"chatcmpl-{req_id}")
+        base = {**_base(f"chatcmpl-{req_id}"), **(extra or {})}
 
         def _chunk(delta: dict, finish_reason: str | None) -> str:
             return _sse({**base, "object": "chat.completion.chunk",
@@ -92,6 +109,8 @@ def create_app(engine: LLMEngine) -> FastAPI:
             kind, payload = await queue.get()
             if kind == "done":
                 r: GenerationResult = payload
+                if on_done is not None:
+                    on_done(r)
                 if splitter is not None:
                     for chunk in _emit(splitter.flush()):
                         yield chunk
@@ -147,6 +166,53 @@ def create_app(engine: LLMEngine) -> FastAPI:
         """文本 -> [1, n] token id(放到 CPU, 由引擎线程搬到模型设备)."""
         return torch.tensor(engine.tokenizer(text)["input_ids"]).unsqueeze(0)
 
+    def _handle_agent_request(req: ChatCompletionRequest) -> str | None:
+        """agent 模式: 校验 trace、取回/新建会话; chat 模式返回 None.
+
+        stream 与非 stream 都先走这一步, 流式首 chunk 就能回传 session_id.
+        返回的 session_id 同时用于: 响应回传、生成结束后累计会话用量.
+        """
+        if req.mode != "agent":
+            return None  # chat 模式: session_id/trace 字段忽略, 保持 OpenAI 兼容
+        if not req.trace:
+            raise HTTPException(400, "agent 模式必须提供 trace 调用路径")
+        try:
+            session_id, _ = agent_sessions.get_or_create(req.session_id, req.trace)
+        except KeyError:
+            raise HTTPException(404, f"会话 {req.session_id} 不存在, 请先发起不带 session_id 的 agent 请求")
+        return session_id
+
+    def _agent_kv_finish(session_id: str, trace: list[str], prompt_ids: torch.Tensor,
+                         r: GenerationResult, attempted: bool) -> None:
+        """agent 请求生成结束后: 累计复用统计, 并保存本次完整序列 KV.
+
+        保存的序列 = 实际 prefill 的 prompt(截断后) + 生成输出, 与 KV cache
+        逐位对齐、位置从 0 开始 —— 下一次请求(main 从子 agent 返回后)即可
+        作为前缀复用候选.
+        """
+        if r.reused_prompt_tokens > 0:
+            kv_store.note_hit(r.reused_prompt_tokens)
+            agent_sessions.record_kv_reuse(session_id, r.reused_prompt_tokens)
+            logger.info("请求 %s: 会话 %s trace %s KV 前缀复用 %d tok"
+                        "(prompt %d tok, 跳过 %.0f%% prefill; 来源见引擎日志)",
+                        r.request_id, session_id, trace, r.reused_prompt_tokens,
+                        r.prompt_tokens,
+                        100.0 * r.reused_prompt_tokens / max(r.prompt_tokens, 1))
+        elif attempted:
+            logger.info("请求 %s: trace %s 触发 KV 复用但前缀不匹配, 回退全量 prefill "
+                        "(常见原因: chat template 对末尾 assistant 消息重新渲染, "
+                        "如 Qwen3 的 <think> 块)", r.request_id, trace)
+        if r.kv_cache is None:
+            return
+        if r.kv_graft_mismatch:
+            kv_store.note_graft_mismatch()
+        seq_tokens = prompt_ids[0][-r.prompt_tokens:].tolist() + r.output_tokens
+        kind = KIND_MAIN if trace[-1] == KIND_MAIN else KIND_SUB
+        # prompt_len/think_len 用于拼接模式: 记录输出 KV 起始位置与开头
+        # <think> 块的 token 数, 拼接时切出/剔除对应 KV
+        kv_store.put(session_id, kind, seq_tokens, r.kv_cache,
+                     prompt_len=r.prompt_tokens, think_len=r.output_think_tokens)
+
     # ------------------------------------------------------------------
     # 路由
     # ------------------------------------------------------------------
@@ -196,6 +262,9 @@ def create_app(engine: LLMEngine) -> FastAPI:
         if engine.tokenizer.chat_template is None:
             raise HTTPException(400, "当前模型没有 chat template, 请改用 /v1/completions")
 
+        # agent 模式: 建/取会话(见 _handle_agent_request)
+        session_id = _handle_agent_request(req)
+
         # tool_choice="none" 时不渲染工具; 其余情况(缺省/auto/required/指定工具)一律自动
         tools = req.tools if (req.tools and req.tool_choice != "none") else None
         # 只有渲染了工具才需要解析 <tool_call> 输出(此时保留特殊 token 供解析)
@@ -205,7 +274,10 @@ def create_app(engine: LLMEngine) -> FastAPI:
         kwargs = {"add_generation_prompt": True, "tokenize": True}
         if tools is not None:
             kwargs["tools"] = tools
-        if engine.config.enable_thinking is not None:
+        # 请求级 enable_thinking 优先, 其次服务端配置(--enable-thinking/--no-enable-thinking)
+        if req.enable_thinking is not None:
+            kwargs["enable_thinking"] = req.enable_thinking
+        elif engine.config.enable_thinking is not None:
             kwargs["enable_thinking"] = engine.config.enable_thinking
         try:
             ids = engine.tokenizer.apply_chat_template(_message_dicts(req.messages), **kwargs)
@@ -215,18 +287,48 @@ def create_app(engine: LLMEngine) -> FastAPI:
             ids = ids.input_ids
         prompt_ids = torch.tensor(ids).unsqueeze(0)
 
+        # 跨请求前缀 KV 复用(agent 模式):
+        # - --reuse-agent-kv       : LCP 安全模式, 引擎做 token 级匹配, 不匹配回退
+        # - --reuse-agent-kv-append: 位置感知拼接模式(实验), 在 prompt 中定位子 agent
+        #                            输出正文, 把其 KV 直接插进 main 的 KV cache;
+        #                            main 段同时作为拼接基础与回退候选(定位失败回退 LCP)
+        reuse_prefixes, graft = None, None
+        if session_id is not None and engine.config.reuse_agent_kv_append:
+            prompt_tokens = prompt_ids[0].tolist()
+            graft = kv_store.build_graft(session_id, req.trace, prompt_tokens)
+            reuse_prefixes = kv_store.propose(session_id, req.trace)
+        elif session_id is not None and engine.config.reuse_agent_kv:
+            reuse_prefixes = kv_store.propose(session_id, req.trace)
+
         sampling = req.to_sampling()
         req_id = uuid.uuid4().hex[:12]
 
         if req.stream:
             splitter = ToolCallStreamSplitter() if parse_tools else None
             queue = await engine.generate(req_id, prompt_ids, sampling, stream=True,
-                                          skip_special_tokens=not parse_tools)
-            return StreamingResponse(_chat_streamer(req_id, queue, splitter),
+                                          skip_special_tokens=not parse_tools,
+                                          reuse_prefixes=reuse_prefixes,
+                                          graft=graft)
+            extra, on_done = None, None
+            if session_id is not None:
+                # 每个 SSE chunk 顶层都带会话字段; 生成结束(done)时累计用量并保存 KV
+                extra = {"session_id": session_id, "trace": req.trace}
+                attempted = bool(reuse_prefixes) or graft is not None
+                kv_reuse_on = engine.config.reuse_agent_kv or engine.config.reuse_agent_kv_append
+
+                def on_done(r):
+                    agent_sessions.record_usage(
+                        session_id, r.prompt_tokens, r.completion_tokens)
+                    if kv_reuse_on:
+                        _agent_kv_finish(session_id, req.trace, prompt_ids, r, attempted)
+
+            return StreamingResponse(_chat_streamer(req_id, queue, splitter, extra, on_done),
                                      media_type="text/event-stream", headers=STREAM_HEADERS)
 
         r = await engine.generate(req_id, prompt_ids, sampling,
-                                  skip_special_tokens=not parse_tools)
+                                  skip_special_tokens=not parse_tools,
+                                  reuse_prefixes=reuse_prefixes,
+                                  graft=graft)
         if parse_tools:
             tool_calls = parse_tool_calls(r.output_text)
             content = clean_content(r.output_text) or None
@@ -235,10 +337,26 @@ def create_app(engine: LLMEngine) -> FastAPI:
         message: dict = {"role": "assistant", "content": content}
         if tool_calls:
             message["tool_calls"] = tool_calls
-        return {**_base(f"chatcmpl-{req_id}"), "object": "chat.completion",
+        resp = {**_base(f"chatcmpl-{req_id}"), "object": "chat.completion",
                 "choices": [{"index": 0, "message": message,
                              "finish_reason": "tool_calls" if tool_calls else r.finish_reason}],
                 "usage": _usage(r)}
+        if session_id is not None:
+            agent_sessions.record_usage(session_id, r.prompt_tokens, r.completion_tokens)
+            if engine.config.reuse_agent_kv or engine.config.reuse_agent_kv_append:
+                attempted = bool(reuse_prefixes) or graft is not None
+                _agent_kv_finish(session_id, req.trace, prompt_ids, r, attempted)
+            resp["session_id"] = session_id
+            resp["trace"] = req.trace
+            # 实验观测字段: 本次请求跳过 prefill 的 token 数(含拼接的子 agent 输出 KV),
+            # 供客户端验证 --reuse-agent-kv / --reuse-agent-kv-append 的效果
+            resp["reused_prompt_tokens"] = r.reused_prompt_tokens
+        return resp
+
+    @app.get("/v1/agent/sessions")
+    async def agent_sessions_list():
+        """agent 模式会话列表: 会话 id / 最新 trace / agent 名单 / 请求数与 token 累计."""
+        return {"object": "list", "data": agent_sessions.list_sessions()}
 
     @app.get("/v1/stats")
     async def stats():
@@ -249,6 +367,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
             "max_num_seqs": engine.config.max_num_seqs,
             "max_model_len": engine.config.max_model_len,
             **engine._stats,
+            "kv_reuse": kv_store.stats,
         }
 
     return app

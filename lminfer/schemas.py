@@ -62,4 +62,17 @@ class ChatCompletionRequest(_SamplingFields):
     messages: list[ChatMessage]
     tools: list[dict] | None = None      # OpenAI 函数 schema 列表, 渲染进 chat template
     tool_choice: str | dict | None = None  # "auto"/"none"/"required" 或 {"type":"function",...}
+    enable_thinking: bool | None = None  # Qwen3 等模型的 thinking 开关: 请求级覆盖服务端配置,
+                                        # None 表示用服务端 --enable-thinking/--no-enable-thinking
+    mode: Literal["chat", "agent"] = "chat"  # chat = 普通对话; agent = agent 事务(见 server.py)
+    session_id: str | None = None        # agent: 首次缺省由服务端生成并回传, 后续请求带回
+    trace: list[str] | None = None       # agent: 调用路径, 如 ["main","sub1","main"], 末位是当前 agent
+
+    @field_validator("trace")
+    @classmethod
+    def _normalize_trace(cls, v):
+        """trace 元素必须是非空字符串(缺 trace 的业务校验在 server.py 返回 400)."""
+        if v is not None and any(s == "" for s in v):
+            raise ValueError("trace 的元素不能为空字符串")
+        return v
 

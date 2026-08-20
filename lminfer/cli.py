@@ -42,8 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--max-num-seqs", type=int, default=4,
                          help="最大并发请求数(朴素并发 = 线程数)")
     p_serve.add_argument("--trust-remote-code", action="store_true")
-    p_serve.add_argument("--enable-thinking", action="store_true",
-                         help="给 apply_chat_template 传 enable_thinking=True(Qwen3 等)")
+    p_serve.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=None,
+                         help="给 apply_chat_template 传 enable_thinking 开关(Qwen3 等): "
+                              "--enable-thinking 传 True, --no-enable-thinking 传 False; "
+                              "都不传则走模板默认(不传该参数)")
     p_serve.add_argument("--disable-log-stats", action="store_true")
 
     # ---- 为兼容 vLLM 命令而接受、但朴素实现不生效的参数 ----
@@ -58,6 +60,20 @@ def build_parser() -> argparse.ArgumentParser:
                               "none 关闭. 默认 auto")
     p_serve.add_argument("--enable-auto-tool-choice", action="store_true",
                          help="兼容 vLLM 参数; 朴素实现在请求带 tools 时始终自动选择, 该参数仅接受")
+    p_serve.add_argument("--reuse-agent-kv", action="store_true",
+                         help="agent 模式跨请求前缀 KV 复用(默认关闭): main 在子 agent 返回后"
+                              "继续请求时, 复用已保存的子 agent 输出 KV 与前缀历史 KV, 跳过重复"
+                              " prefill. 通过 token 级最长公共前缀匹配保证正确性, 不匹配时自动"
+                              " 回退全量 prefill")
+    p_serve.add_argument("--reuse-agent-kv-append", action="store_true",
+                         help="位置感知拼接模式(默认关闭, 实验用途): main 在子 agent 返回后"
+                              "继续请求时, 在渲染后的 prompt 中定位子 agent 输出正文, 把其 KV"
+                              "直接插入 main 的 KV cache 对应位置, 跳过这段的重复 prefill —— "
+                              "main 历史仍按 LCP 复用, 定位失败自动回退. 注意: 子输出 KV 在"
+                              "子 agent 自己的上下文里计算, 插入后与全量 prefill 存在近似差异")
+    p_serve.add_argument("--kv-segment-idle-ttl", type=float, default=None,
+                         help="已保存 KV 段的会话闲置超时秒数(默认 3600): 会话闲置超过该时长, "
+                              "其全部 KV 段被清理释放显存. 0 表示不清理")
 
     # ---- lminfer chat: 交互式对话(便于不启动服务快速验证) ----
     p_chat = sub.add_parser("chat", help="交互式命令行对话")
@@ -103,8 +119,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
         served_model_name=args.served_model_name,
         trust_remote_code=args.trust_remote_code,
         disable_log_stats=args.disable_log_stats,
-        enable_thinking=True if args.enable_thinking else None,
+        enable_thinking=args.enable_thinking,  # --enable-thinking=True / --no-enable-thinking=False / 缺省 None
         tool_call_parser=args.tool_call_parser or "auto",
+        reuse_agent_kv=args.reuse_agent_kv,
+        reuse_agent_kv_append=args.reuse_agent_kv_append,
+        kv_segment_idle_ttl=args.kv_segment_idle_ttl if args.kv_segment_idle_ttl is not None else 3600.0,
     )
     logger.info("启动服务: %s:%d (模型 %s)", args.host, args.port, args.model)
     run_server(config, host=args.host, port=args.port)

@@ -36,13 +36,17 @@ LMInfer/
 │   ├── cli.py                # lminfer serve / chat 命令行入口
 │   ├── config.py             # EngineConfig / SamplingParams
 │   ├── engine.py             # ★ 核心: prefill + decode 生成循环, KV cache 显式可见
+│   ├── kvcache.py            # ★ agent 会话间跨请求 KV 前缀复用(简单 KV Cache 系统)
 │   ├── schemas.py            # OpenAI 兼容请求模型
+│   ├── sessions.py           # agent 会话注册表(trace 追踪 / token 累计)
+│   ├── toolcalls.py          # Qwen 风格 <tool_call> 解析
 │   └── server.py             # FastAPI 路由 + SSE 流式
 ├── examples/
 │   ├── client.py             # 客户端示例(chat/completions, 流式/非流式)
 │   └── bench.py              # 并发压测(TTFT / TPOT / 吞吐)
 ├── experiments/
-│   └── kv_cache_compare.py   # ★ 理论验证实验: KV cache 开/关对比
+│   ├── kv_cache_compare.py   # ★ 理论验证实验: KV cache 开/关对比
+│   └── agent_kv_reuse.py     # ★ 理论验证实验: agent 会话间 KV 前缀复用开/关对比
 └── README.md
 ```
 
@@ -63,6 +67,9 @@ python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 `--gpu-memory-utilization`、`--tensor-parallel-size`、`--kv-transfer-config`、
 `--enable-auto-tool-choice`、`--tool-call-parser` 等参数会被接受，
 但朴素实现中不生效（启动时会打印 WARNING 说明原因）。
+
+`--reuse-agent-kv` 是 agent 模式下的跨请求 KV 前缀复用开关（默认关闭），
+详见下文 [跨请求 KV 复用](#跨请求-kv-复用--reuse-agent-kv)。
 
 验证服务：
 
@@ -94,8 +101,150 @@ python examples/bench.py --prompts 8 --max-tokens 64
 | `GET /health` | 健康检查 |
 | `GET /v1/models` | 模型列表 |
 | `POST /v1/completions` | 文本补全（OpenAI 格式，支持 stream） |
-| `POST /v1/chat/completions` | 对话补全（支持 stream） |
+| `POST /v1/chat/completions` | 对话补全（支持 stream，支持 agent 模式） |
+| `GET /v1/agent/sessions` | agent 模式会话列表（会话 id / trace / token 累计，朴素实现额外提供） |
 | `GET /v1/stats` | 运行时统计（KV 占用/请求数/吞吐，朴素实现额外提供） |
+
+## Agent 模式（会话追踪）
+
+模型调用程序可以按两种模式调用 `/v1/chat/completions`：
+
+- `mode: "chat"`（默认，OpenAI 兼容）：每个请求相互独立，与普通 vLLM 用法一致；
+- `mode: "agent"`：把一个任务由主/子 agent 发起的多次模型调用关联到同一个会话。
+
+agent 模式下请求需携带 `trace`（agent 调用路径，最后一个元素是当前 agent，
+例如 `["main", "sub1", "main"]`）：
+
+- 首次请求不带 `session_id`，LMInfer 会生成一个 UUID 字符串并随响应返回
+  （流式时每个 SSE chunk 顶层都带），应用保存它供后续请求回传；
+- 后续请求回传 `session_id`，同一会话的请求数、累计 token、出现过的 agent
+  名单都会被记录，可通过 `GET /v1/agent/sessions` 观测整个大任务的资源消耗；
+- 传了不存在的 `session_id` 返回 404（不静默新建）；`mode: "agent"` 不带
+  `trace` 返回 400。
+
+```bash
+# 首次 agent 请求: 响应里会多出 session_id / trace 字段
+curl -N http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"mode": "agent", "trace": ["main"], "messages": [{"role": "user", "content": "..."}], "stream": true}'
+
+# 后续请求回传 session_id(示例: 主 agent 调起子 agent)
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"mode": "agent", "session_id": "<上一步返回的 id>", "trace": ["main", "sub1"], "messages": [...]}'
+
+# 观测: 会话 id 列表 + 每个会话的请求数与 token 累计
+curl http://localhost:8000/v1/agent/sessions
+```
+
+## 跨请求 KV 复用（`--reuse-agent-kv`）
+
+### 解决的问题
+
+主 agent 调起子 agent 后，子 agent 的输出会回到主 agent 的上下文，
+主 agent 的下一轮请求在 prompt 里**重新包含了这段历史**。默认实现会对整个
+prompt 重新 prefill——历史 token 的 KV 明明在子 agent 请求里已经算过一遍，
+却被重复计算。
+
+本特性（`lminfer serve ... --reuse-agent-kv`，默认关闭）让 agent 会话
+**保存最近的 KV cache 并在下一次请求中复用**，这正是 vLLM 自动前缀缓存的
+朴素版。
+
+### 工作原理
+
+1. **保存**：每个 agent 会话按请求来源（`main` / `sub`）保存最近一次请求的
+   完整序列（prompt + 生成输出）及其 KV cache，位置从 0 开始、与 token 序列
+   逐位对齐（`lminfer/kvcache.py` 的 `SessionKVStore`）；
+2. **触发**：当请求的 trace 末位是 `main` 且前一个是子 agent（如
+   `["main", "sub1", "main"]`），即主 agent 在子 agent 返回后继续生成时，
+   尝试复用已保存的前缀 KV（优先子 agent 的输出 KV）；
+3. **正确性守卫**：引擎对新 prompt 与保存的序列做 **token 级最长公共前缀
+   （LCP）匹配**，只复用真正相同的部分，其余继续 prefill。KV 是 (token, 位置)
+   的确定性函数——token 与位置都一致，注意力结果在数学上就与全量 prefill
+   完全相同。任何不匹配都安全回退，绝不产生错误结果；
+4. **深拷贝**：transformers 的 `DynamicCache.update` 是原地拼接，复用前必须
+   拷贝切片，否则后续请求会污染已保存的缓存（并发安全：store 读写都在事件
+   循环上，生成线程只持有拷贝）。
+
+### 观测方式
+
+```bash
+lminfer serve /path/to/model --reuse-agent-kv
+
+# 服务日志: 复用发生时打印
+#   请求 xxx: 复用前缀 KV 31 tok, 剩余 55 tok prefill
+#   请求 xxx: prompt 86 tok, 生成 8 tok, ..., 复用前缀 31 tok
+
+# 全局统计与每会话统计
+curl http://localhost:8000/v1/stats             # kv_reuse: attempts/hits/tokens
+curl http://localhost:8000/v1/agent/sessions    # 每个会话的 kv_reuse_count/tokens
+```
+
+### 实验与注意事项
+
+```bash
+python experiments/agent_kv_reuse.py --model /path/to/model
+```
+
+- **复用率取决于 chat template**：模板对同一段历史是否做一致的渲染决定 LCP
+  长度。Qwen3 会对**末尾 assistant 消息**插入 `<think>` 块（与后续有 tool
+  消息时的渲染不同），导致 LCP 变短（约 30%）；ERNIE 等模板渲染一致，
+  复用率可达 80%+；
+- **数值等价性**：复用与全量 prefill 数学上等价，但 bf16 精度下存在
+  内核级舍入差异（与切换 attention 实现同级，~1e-2 相对误差），贪心输出
+  通常逐 token 一致，个别低置信位置可能翻转，属正常现象；
+- 显存代价：每个会话保留最近一次 `main` / `sub` 请求的完整 KV cache，
+  长会话会占额外显存，旧段随新请求替换而释放。
+
+### 位置感知拼接模式（`--reuse-agent-kv-append`，实验）
+
+LCP 安全模式只能复用"前缀完全一致"的 KV。子 agent 的输出作为 tool 结果
+回填进 main 的下一轮 prompt 时，其 token 由 chat template 重新渲染（正文
+前后带 role 标记，如 Qwen3 的 `<tool_response>` 包裹），不构成任何已保存
+段的公共前缀，LCP 匹配不到 —— 这段 KV 明明在子 agent 请求里已经算过，
+却只能重新 prefill。若想**直接复用子 agent 输出的 KV**，用拼接模式：
+
+```bash
+lminfer serve /path/to/model --reuse-agent-kv-append
+```
+
+机制：main 在子 agent 返回后继续请求时，服务端（`SessionKVStore.build_graft`）
+在渲染后的 prompt token 序列中**定位子 agent 输出正文的位置**，把子 agent
+请求时算好的输出 KV **直接插进 main 的 KV cache 对应位置**（引擎的
+`KVGraft` 流程）：
+
+```text
+新 prompt = [main 历史(KV 已存)] [role 标记] [子输出正文] [role 标记] [新内容]
+                  LCP 复用              prefill       ↑ 插入子输出 KV      prefill
+```
+
+- **锚点**：子输出是"本轮新内容"，搜索起点取最新 main 段长度，历史里与
+  子输出相似的文本（如任务原文）直接被排除；
+- **边界漂移**：客户端把输出解码成文本再回填，模板对同一文本重新分词 ——
+  BPE 对同一字符串的切分是确定的，但正文首尾可能与其相邻的换行/标记合并
+  （如结尾 `。` 与模板追加的 `\n` 合成一个 token），导致渲染出的 token 与
+  保存的正文在边界处不一致。`build_graft` 搜索**最长逐位一致前缀**（允许
+  开头 1-2 个 token 并入前一标记），只拼接一致的部分，其余（通常是尾部
+  1-2 个边界 token）正常 prefill —— 拼接的 KV 与 token 严格对齐；
+- **剔除 thinking**：`<think>...</think>` 块通常不作为下一轮对话的 prompt
+  （客户端回填时剥离），子段输出里开头 think 块的 KV 被挖掉，只拼接正文；
+- **回退**：定位失败或匹配太短（< 4 token）时安全回退到 LCP 模式（复用
+  main 历史），绝不错误拼接。校验失败记入 `/v1/stats` 的 `graft_mismatches`。
+
+⚠️ 注意：拼接的 KV 是在**子 agent 自己的上下文**里计算的，插入 main 上下文
+后，注意力结果与全量 prefill 存在**近似差异**（实验用途）。但位置与 token
+是对齐的，且 main 历史部分仍走 LCP 精确复用 —— 这是"跨请求 KV 直通"的
+朴素实现，正确性边界见下方日志与一致性实验。
+
+```bash
+# 服务日志会显示定位、拼接与复用
+#   会话 xxx: 定位子 agent 输出正文 KV 52 tok(prompt 位置 582..633, 剔除 think 0 tok / 边界漂移 1 tok), 准备插入
+#   请求 xxx: 拼接子 agent 输出 KV 52 tok(位置 582..633) + 复用 main 历史 KV 575 tok, 剩余 18 tok prefill
+#   请求 xxx: prompt 645 tok, 生成 60 tok, ..., 复用前缀 627 tok
+#   请求 xxx: 会话 xxx trace ['main', 'researcher', 'main'] KV 前缀复用 627 tok(prompt 645 tok, 跳过 97% prefill; 来源见引擎日志)
+```
+
+与 `--reuse-agent-kv`（LCP 模式）的关系：拼接模式是 LCP 模式的超集 ——
+main 历史仍按 LCP 精确复用，定位失败时自动回退到 LCP 行为，因此单独开
+`--reuse-agent-kv-append` 即可同时获得两者收益。
 
 ## KV Cache 理论速览（本项目要验证的东西）
 
@@ -144,4 +293,6 @@ python experiments/kv_cache_compare.py --model /home/tanger/workspace/models/Qwe
 2. **PagedAttention**：本项目 KV 是一个随长度增长的连续张量；vLLM 按 16-token 块分配，
    解决碎片化与内存浪费。理解 `DynamicCache` 之后再对比 `StaticCache`。
 3. **调度与抢占**：vLLM 有 preemption（长序列被抢占时交换或重算）；本项目直接排队。
-4. **前缀缓存**：vLLM 有 automatic prefix caching；本项目完全没有。
+4. **前缀缓存**：vLLM 有 automatic prefix caching；本项目在 agent 模式下用
+   `--reuse-agent-kv` 实现了朴素版（trace 触发 + token 级 LCP 匹配，见
+   [跨请求 KV 复用](#跨请求-kv-复用--reuse-agent-kv)），全局自动前缀缓存仍未实现。

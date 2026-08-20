@@ -36,6 +36,16 @@ from transformers import (
 )
 
 from .config import EngineConfig, SamplingParams
+from .kvcache import (
+    KIND_MAIN,
+    KIND_SUB,
+    KVGraft,
+    KVPrefix,
+    concat_cache,
+    longest_common_prefix,
+    slice_cache,
+)
+from .toolcalls import THINK_END, THINK_START
 
 logger = logging.getLogger("lminfer")
 
@@ -52,6 +62,12 @@ class GenerationResult:
     ttft_ms: float                  # 首 token 延迟(time to first token)
     decode_ms: float                # 首 token 之后的生成耗时
     kv_cache_bytes: int             # 结束时 KV cache 显存占用(字节)
+    reused_prompt_tokens: int = 0   # 本次请求复用前缀 KV 的 token 数(0 = 全量 prefill)
+    kv_cache: DynamicCache | None = None  # 完整 KV cache(prompt + 输出, 与序列严格对齐),
+                                          # 供 agent 会话间复用保存; 无缓存模式为 None
+    output_think_tokens: int = 0    # 输出开头 <think> 块的 token 数(拼接模式剔除用:
+                                    # think 不作为下一轮对话的 prompt, 拼接 KV 时挖掉)
+    kv_graft_mismatch: bool = False  # 位置感知拼接模式: 插入位置/长度/token 校验失败(已回退)
 
     @property
     def completion_tokens(self) -> int:
@@ -95,6 +111,12 @@ class LLMEngine:
         if self.tokenizer.pad_token is None:
             # 与 vLLM 相同: 无 pad token 的模型用 eos token 兜底
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # <think>/</think> 特殊 token id(拼接模式剔除 think KV 用);
+        # 模型没有这两个 token 时置 None, think 检测自动禁用
+        ids = self.tokenizer.convert_tokens_to_ids([THINK_START, THINK_END])
+        self._think_ids = (ids[0], ids[1]) if all(
+            isinstance(i, int) and i >= 0 for i in ids) else None
 
         # attn_implementation: "auto" 传 None, 让 transformers 用默认(sdpa);
         # 显式指定(如 flash_attention_2)则透传, 未安装 flash-attn 时由 transformers 回退 kernels 或报错
@@ -183,12 +205,25 @@ class LLMEngine:
         use_kv_cache: bool = True,         # False 仅用于理论对比实验
         on_token: Callable[[int], None] | None = None,  # 每生成一个 token 回调(流式输出用)
         skip_special_tokens: bool = True,  # False 用于工具调用: 保留 <tool_call> 等标记供解析
+        reuse_prefixes: list[KVPrefix] | None = None,  # 跨请求前缀 KV 复用候选(agent 模式, LCP 安全)
+        graft: KVGraft | None = None,  # 位置感知拼接: 把子 agent 输出 KV 插入 main prompt 指定位置
     ) -> GenerationResult:
         """prefill + decode 的生成循环, 返回完整结果.
 
         两种模式的对照(这正是"KV cache 省了什么"的实验基础):
         - use_kv_cache=True : decode 每次只喂 1 个 token, 其余全靠 cache
         - use_kv_cache=False: decode 每次把整个前缀重新前向(无缓存)
+
+        跨请求复用有两种模式(见 kvcache.py, 可叠加):
+        - reuse_prefixes: LCP 安全模式。对每个候选段与本次 prompt 做 token 级
+          最长公共前缀匹配, 只复用真正相同的部分, 不匹配时安全回退全量 prefill;
+        - graft         : 位置感知拼接模式(实验)。子 agent 输出的 KV 由 server 端
+          定位到其在 prompt 中的位置(KVGraft.position), 引擎先 LCP 复用 main
+          历史 KV, prefill 到插入点后把子输出 KV 直接插进 cache, 再 prefill 剩余
+          部分 —— 跳过子输出这段在 main 上下文里的重复 prefill. 插入位置/长度/
+          token 逐位校验, 失败自动回退 LCP 模式(绝不错误拼接).
+          注意: 子输出 KV 是在子 agent 自己的上下文里计算的, 插入 main 上下文
+          后注意力结果与全量 prefill 存在近似差异(实验用途).
         """
         # 截断 prompt, 保证总长度不超过 max_model_len
         max_prompt = self.config.max_model_len - sampling.max_tokens
@@ -203,24 +238,159 @@ class LLMEngine:
         generated: list[int] = []                    # 已生成的 token id
         all_ids = prompt_ids                         # 完整序列 = prompt + 已生成(采样器用)
         cache = DynamicCache(config=self.model.config)  # KV cache 容器
+
+        # ---- 跨请求前缀 KV 复用 ----
+        # KV 是 (token, 位置) 的确定性函数: 只有 token 与位置都一致的前缀才能复用.
+        # 整段命中(LCP == n_prompt, 即客户端原样重发同一 prompt)时只需 prefill
+        # 最后 1 个 token 就能拿到它的 logits, 同样成立.
+        reuse_len = 0
+        graft_mismatch = False
+        graft_plan: tuple[int, int, int] | None = None  # (基础复用长度, 插入位置, 子输出长度)
+        if use_kv_cache and graft is not None:
+            # 位置感知拼接模式(实验用途): 子 agent 输出的 KV 由 server 端定位
+            # (KVGraft.position), 直接插进 main 的 KV cache, 跳过这段在 main
+            # 上下文里的重复 prefill.
+            # 结构: [LCP 复用 main 历史 base_len] + prefill [base_len, p)
+            #       + 插入子输出 KV(L 个位置) + prefill [p+L, n)
+            # 正确性守卫(失败安全回退 LCP, 绝不错误拼接):
+            #   1. 插入点 p 必须在 prompt 内(0 < p < n), 且 p+L 不越界;
+            #   2. 子输出 tokens 与 prompt 在 [p, p+L) 逐位一致(位置对齐的前提);
+            #   3. 基础复用段不能越过插入点(base_len <= p).
+            prompt_list = prompt_ids[0].tolist()
+            n = n_prompt
+            p, L = graft.position, len(graft.tokens)
+            # 基础段: 与 LCP 模式相同的候选选择, 但封顶在插入点(基础段不能越过子输出)
+            base_len, base_cache = 0, None
+            for prefix in sorted(reuse_prefixes,
+                                 key=lambda pr: len(pr.tokens), reverse=True):
+                m = min(longest_common_prefix(prompt_list, prefix.tokens), p)
+                if m > base_len:
+                    base_len, base_cache = m, prefix.cache
+                if base_len == min(len(prefix.tokens), p):
+                    break
+            if not (0 < p < n and p + L <= n and base_len <= p
+                    and prompt_list[p:p + L] == graft.tokens):
+                graft_mismatch = True
+                logger.warning(
+                    "请求 %s: 拼接结构校验失败(插入位置 %d, 子输出 %d tok), "
+                    "回退 LCP 复用 %d tok", request_id, p, L, base_len)
+                reuse_len = min(base_len, n - 1)
+                if reuse_len > 0:
+                    cache = slice_cache(base_cache, reuse_len, self.model.config)
+            else:
+                graft_plan = (base_len, p, L)
+                if base_len > 0:
+                    cache = slice_cache(base_cache, base_len, self.model.config)
+        elif use_kv_cache and reuse_prefixes:
+            prompt_list = prompt_ids[0].tolist()
+            best_len, best_cache, best_prefix = 0, None, None
+            # 候选按长度降序: 当前候选全长命中即短路(更长的候选不存在, 更短的
+            # 候选 LCP 不可能超过自身长度), 避免长会话里逐段比较的开销
+            for prefix in sorted(reuse_prefixes,
+                                 key=lambda p: len(p.tokens), reverse=True):
+                m = longest_common_prefix(prompt_list, prefix.tokens)
+                if m > best_len:
+                    best_len, best_cache, best_prefix = m, prefix.cache, prefix
+                if best_len == len(prefix.tokens):
+                    break
+            if best_len > 0:
+                # 必须深拷贝切片: transformers 的 DynamicCache.update 原地拼接,
+                # 直接把已保存的缓存传给生成循环会污染 store 里的对象
+                reuse_len = min(best_len, n_prompt - 1)
+                cache = slice_cache(best_cache, reuse_len, self.model.config)
+                # 复用的前缀来自哪个段: 子 agent 输出(核心收益)还是 main 历史
+                src = "子 agent" if best_prefix.kind == KIND_SUB else \
+                    ("main" if best_prefix.kind == KIND_MAIN else "未知来源")
+                out_reused = max(0, best_len - best_prefix.output_start)
+                if out_reused > 0:
+                    # 复用穿透到了上一轮的输出段(prompt KV + 输出 KV 双复用)
+                    logger.info(
+                        "请求 %s: 复用%s 历史 KV %d tok + 输出 KV %d tok"
+                        "(prompt %d tok 的 %.0f%%), 剩余 %d tok prefill",
+                        request_id, src, best_prefix.output_start, out_reused,
+                        n_prompt, 100.0 * best_len / n_prompt, n_prompt - best_len)
+                else:
+                    logger.info("请求 %s: 复用%s 历史 KV %d tok(prompt %d tok 的 %.0f%%), "
+                                "剩余 %d tok prefill", request_id, src, best_len,
+                                n_prompt, 100.0 * best_len / n_prompt,
+                                n_prompt - best_len)
+
         t0 = time.perf_counter()
         ttft_ms = 0.0
 
+        # 输出开头 <think> 块的 token 数跟踪(状态机):
+        #   not_started: 第一个 token 是 <think> 才进入 in_think, 否则直接 done(无 think 块)
+        #   in_think   : 累计 token 数, 遇到 </think> 结束
+        # 只处理"输出开头"的 think 块(Qwen 系标准行为), 中间/结尾的 think 不处理
+        in_think = False
+        think_done = self._think_ids is None
+        output_think = 0
+
         def _on_token(token: int) -> None:
+            nonlocal in_think, think_done, output_think
             generated.append(token)
+            if not think_done:
+                if not in_think:
+                    if token == self._think_ids[0]:
+                        in_think = True
+                        output_think = 1
+                    else:
+                        think_done = True  # 输出不以 <think> 开头
+                else:
+                    output_think += 1
+                    if token == self._think_ids[1]:
+                        in_think = False
+                        think_done = True
             if on_token is not None:
                 on_token(token)
 
         with torch.inference_mode():
             # ---- prefill: 一次性前向整个 prompt ----
             # 有缓存模式: 模型把每一层的 K/V 存入 cache, 后续 decode 全部复用;
+            #   复用前缀时只前向 [reuse_len:], 前缀 K/V 由切片缓存提供(position
+            #   id 自动从 cache 长度继续, mask 仍覆盖整个 prompt, 恒为全 1);
             # 无缓存模式: 同样只做一次前向得到首 token, 但 cache 保持为空.
-            out = self.model(
-                input_ids=prompt_ids,
-                attention_mask=torch.ones_like(prompt_ids),
-                past_key_values=cache if use_kv_cache else None,
-                use_cache=use_kv_cache,
-            )
+            # 位置感知拼接模式: prefill 分两段 —— 先前向 [base_len, p)(补 role
+            # 标记等插入点前的 token), 把子输出 KV 插进 cache, 再前向 [p+L, n);
+            # 若子输出正好到 prompt 末尾, 用最后 1 个 token 的前向拿 logits
+            # (与 LCP 整段命中的处理一致), 此时 cache 长度 n-1, 前向后补到 n.
+            if graft_plan is not None:
+                base_len, p, L = graft_plan
+                device = self.model.device
+                if p > base_len:
+                    out = self.model(
+                        input_ids=prompt_ids[:, base_len:p],
+                        attention_mask=torch.ones(1, p, device=device),
+                        past_key_values=cache, use_cache=True,
+                    )
+                # 插入子输出 KV: concat 产生新对象, 后续原地拼接不会污染 store
+                cache = concat_cache(cache, graft.cache, self.model.config)
+                if p + L < n_prompt:
+                    out = self.model(
+                        input_ids=prompt_ids[:, p + L:],
+                        attention_mask=torch.ones(1, n_prompt, device=device),
+                        past_key_values=cache, use_cache=True,
+                    )
+                    reuse_len = base_len + L  # 跳过 prefill: 基础段 + 子输出
+                else:
+                    cache = slice_cache(cache, n_prompt - 1, self.model.config)
+                    out = self.model(
+                        input_ids=prompt_ids[:, n_prompt - 1:],
+                        attention_mask=torch.ones(1, n_prompt, device=device),
+                        past_key_values=cache, use_cache=True,
+                    )
+                    reuse_len = base_len + L - 1  # 最后 1 个 token 需要前向
+                logger.info(
+                    "请求 %s: 拼接子 agent 输出 KV %d tok(位置 %d..%d) + 复用 "
+                    "main 历史 KV %d tok, 剩余 %d tok prefill",
+                    request_id, L, p, p + L - 1, base_len, n_prompt - reuse_len)
+            else:
+                out = self.model(
+                    input_ids=prompt_ids[:, reuse_len:],
+                    attention_mask=torch.ones_like(prompt_ids),
+                    past_key_values=cache if use_kv_cache else None,
+                    use_cache=use_kv_cache,
+                )
             ttft_ms = (time.perf_counter() - t0) * 1000
             token = self._sample(out.logits[:, -1, :], all_ids, sampling)
             _on_token(token)
@@ -270,6 +440,25 @@ class LLMEngine:
                     generated.pop()
                 output_text = self.tokenizer.decode(generated, skip_special_tokens=skip_special_tokens)
 
+        # ---- 缓存与序列对齐 ----
+        # 对齐目标: cache 长度 == n_prompt + len(generated), 否则下一次跨请求
+        # 复用的位置会错位(见 kvcache.py 的 put 长度校验). 两种偏差来源:
+        #   - 短 1: max_tokens 提前结束, 循环是"先前向再采样", 最后一个生成
+        #     token 的 KV 从未前向 -> 补一次 decode 前向;
+        #   - 长 1: 首 token 即 eos 被清理时, 它的 KV 悬垂在尾部 -> 裁剪.
+        if use_kv_cache:
+            target = n_prompt + len(generated)
+            cur_len = cache.get_seq_length()
+            if cur_len < target:
+                with torch.inference_mode():
+                    self.model(
+                        input_ids=torch.tensor([[generated[-1]]], device=self.model.device),
+                        attention_mask=torch.ones(1, cur_len + 1, device=self.model.device),
+                        past_key_values=cache, use_cache=True,
+                    )
+            elif cur_len > target:
+                cache = slice_cache(cache, target, self.model.config)
+
         # ---- 统计 ----
         total_ms = (time.perf_counter() - t0) * 1000
         kv_bytes = sum(
@@ -285,6 +474,10 @@ class LLMEngine:
             ttft_ms=ttft_ms,
             decode_ms=max(total_ms - ttft_ms, 0.0),
             kv_cache_bytes=kv_bytes,
+            reused_prompt_tokens=reuse_len,
+            kv_cache=cache if use_kv_cache else None,
+            output_think_tokens=output_think,
+            kv_graft_mismatch=graft_mismatch,
         )
 
         # 全局统计 + 每请求日志(风格类似 vLLM 的日志行)
@@ -292,10 +485,11 @@ class LLMEngine:
         self._stats["generated_tokens"] += result.completion_tokens
         self._stats["prefill_tokens"] += n_prompt
         if not self.config.disable_log_stats:
+            reuse_note = f", 复用前缀 {reuse_len} tok" if reuse_len else ""
             logger.info(
-                "请求 %s: prompt %d tok, 生成 %d tok, TTFT %.0fms, %.1f tok/s, KV cache %.2f MiB, %s",
+                "请求 %s: prompt %d tok, 生成 %d tok, TTFT %.0fms, %.1f tok/s, KV cache %.2f MiB, %s%s",
                 request_id, n_prompt, result.completion_tokens, ttft_ms,
-                result.decode_tokens_per_sec, kv_bytes / (1024 ** 2), finish_reason,
+                result.decode_tokens_per_sec, kv_bytes / (1024 ** 2), finish_reason, reuse_note,
             )
         return result
 
@@ -304,13 +498,17 @@ class LLMEngine:
     # ------------------------------------------------------------------
     async def generate(self, request_id: str | None, prompt_ids: torch.Tensor,
                        sampling: SamplingParams, stream: bool = False,
-                       skip_special_tokens: bool = True):
+                       skip_special_tokens: bool = True,
+                       reuse_prefixes: list[KVPrefix] | None = None,
+                       graft: KVGraft | None = None):
         """异步生成.
 
         返回:
           - stream=False: await 得到 GenerationResult
           - stream=True : 返回 asyncio.Queue, 队列元素为 ("text", 文本)
                           或 ("done", GenerationResult) 哨兵
+        reuse_prefixes: LCP 安全模式的跨请求前缀 KV 复用候选(见 kvcache.py);
+        graft:          位置感知拼接的子输出 KV(见 kvcache.py, 与 reuse_prefixes 可叠加).
         """
         request_id = request_id or uuid.uuid4().hex[:8]
         loop = asyncio.get_running_loop()
@@ -327,7 +525,7 @@ class LLMEngine:
                 self.executor,
                 functools.partial(
                     self._generate, request_id, prompt_ids, sampling, True, on_token,
-                    skip_special_tokens,
+                    skip_special_tokens, reuse_prefixes, graft,
                 ),
             )
 
@@ -344,7 +542,7 @@ class LLMEngine:
                 self.executor,
                 functools.partial(
                     self._generate, request_id, prompt_ids, sampling, True, None,
-                    skip_special_tokens,
+                    skip_special_tokens, reuse_prefixes, graft,
                 ),
             )
         )

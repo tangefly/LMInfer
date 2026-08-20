@@ -22,6 +22,15 @@ class EngineConfig:
     disable_log_stats: bool = False  # 关闭每请求统计日志
     enable_thinking: bool | None = None  # Qwen3 等模型的 thinking 开关, None 表示不传
     tool_call_parser: str = "auto"  # auto/qwen: 解析 <tool_call> 块; none: 关闭(对应 vLLM 的 --tool-call-parser)
+    reuse_agent_kv: bool = False    # agent 模式跨请求前缀 KV 复用(见 kvcache.py): 同一会话内
+                                    # 后续请求复用已保存的前缀 KV(prompt + 输出), 跳过重复 prefill
+    reuse_agent_kv_append: bool = False  # 位置感知拼接模式(实验): 在渲染后的 prompt 中定位
+                                         # 子 agent 输出正文, 把其 KV 直接插入 main 的 KV cache
+                                         # 对应位置(见 kvcache.build_graft), main 历史仍按 LCP
+                                         # 复用, 定位失败自动回退; 子输出 KV 在子 agent 自己的
+                                         # 上下文里计算, 与全量 prefill 存在近似差异
+    kv_segment_idle_ttl: float = 3600.0  # 已保存 KV 段的会话闲置超时(秒): 超过后整段清理,
+                                         # 防止会话注册表无 TTL 导致 KV 显存随会话永久增长
 
 
 @dataclass
