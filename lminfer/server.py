@@ -265,8 +265,38 @@ def create_app(engine: LLMEngine) -> FastAPI:
         # agent 模式: 建/取会话(见 _handle_agent_request)
         session_id = _handle_agent_request(req)
 
-        # tool_choice="none" 时不渲染工具; 其余情况(缺省/auto/required/指定工具)一律自动
-        tools = req.tools if (req.tools and req.tool_choice != "none") else None
+        # ---- tool_choice 解析(vLLM 语义) ----
+        # 请求显式给出的 tool_choice 优先; 未给出时由 --enable-auto-tool-choice
+        # 决定默认值: 开启 = "auto"(带 tools 即渲染), 关闭 = "none"(忽略 tools).
+        # 指定单个函数({"type":"function","function":{"name":...}}) 时只渲染该
+        # 工具(与 vLLM 一致). 本地 Qwen 模板只认 tools 参数, 传入 tool_choice
+        # 会被忽略, 语义完全由这里的分支决定.
+        choice = req.tool_choice
+        if choice is None:
+            choice = "auto" if engine.config.enable_auto_tool_choice else "none"
+        choice_name: str | None = None  # 传给模板的 tool_choice 值(auto/required/函数名)
+        if choice == "none":
+            tools = None  # 不渲染工具(显式 none 与默认 none 行为一致)
+        elif isinstance(choice, str):
+            if choice not in ("auto", "required"):
+                raise HTTPException(400, f"不支持的 tool_choice: {choice}")
+            if not req.tools:
+                raise HTTPException(400, f"tool_choice={choice} 但请求未提供 tools")
+            tools, choice_name = req.tools, choice
+        else:
+            # dict 形式: {"type": "function", "function": {"name": ...}}, 只保留该工具
+            name = (choice.get("function") or {}).get("name") if isinstance(choice, dict) else None
+            if not isinstance(name, str) or not name:
+                raise HTTPException(400, "tool_choice 格式错误: 需要 "
+                                         '{"type": "function", "function": {"name": ...}}')
+            if not req.tools:
+                raise HTTPException(400, f"tool_choice 指定了函数 {name} 但请求未提供 tools")
+            tools = [t for t in req.tools
+                     if isinstance(t.get("function"), dict)
+                     and t["function"].get("name") == name]
+            if not tools:
+                raise HTTPException(400, f"tool_choice 指定的函数 {name} 不在 tools 中")
+            choice_name = name
         # 只有渲染了工具才需要解析 <tool_call> 输出(此时保留特殊 token 供解析)
         parse_tools = bool(tools) and engine.config.tool_call_parser != "none"
 
@@ -274,6 +304,9 @@ def create_app(engine: LLMEngine) -> FastAPI:
         kwargs = {"add_generation_prompt": True, "tokenize": True}
         if tools is not None:
             kwargs["tools"] = tools
+        if choice_name is not None:
+            # 本地模板无 tool_choice 参数会自动忽略; 支持它的模板按 vLLM 语义渲染
+            kwargs["tool_choice"] = choice_name
         # 请求级 enable_thinking 优先, 其次服务端配置(--enable-thinking/--no-enable-thinking)
         if req.enable_thinking is not None:
             kwargs["enable_thinking"] = req.enable_thinking

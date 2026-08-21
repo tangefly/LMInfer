@@ -21,7 +21,11 @@ class EngineConfig:
     trust_remote_code: bool = False  # 允许执行远程模型代码(个别模型需要)
     disable_log_stats: bool = False  # 关闭每请求统计日志
     enable_thinking: bool | None = None  # Qwen3 等模型的 thinking 开关, None 表示不传
-    tool_call_parser: str = "auto"  # auto/qwen: 解析 <tool_call> 块; none: 关闭(对应 vLLM 的 --tool-call-parser)
+    tool_call_parser: str = "auto"  # auto/qwen/hermes: 解析 <tool_call> 块; none: 关闭
+                                    # (对应 vLLM 的 --tool-call-parser, Qwen 与 Hermes 格式相同)
+    enable_auto_tool_choice: bool = False  # 请求带 tools 且未显式给 tool_choice 时默认按 auto
+                                           # 处理; 关闭时默认 none(忽略 tools). 显式 tool_choice
+                                           # 始终优先(对应 vLLM 的 --enable-auto-tool-choice)
     reuse_agent_kv: bool = False    # agent 模式跨请求前缀 KV 复用(见 kvcache.py): 同一会话内
                                     # 后续请求复用已保存的前缀 KV(prompt + 输出), 跳过重复 prefill
     reuse_agent_kv_append: bool = False  # 位置感知拼接模式(实验): 在渲染后的 prompt 中定位

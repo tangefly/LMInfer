@@ -55,11 +55,13 @@ def build_parser() -> argparse.ArgumentParser:
         ("--kv-transfer-config", "朴素实现不接入 KV 传输(如 LMCache)"),
     ]:
         p_serve.add_argument(name, default=None, help=f"兼容 vLLM 参数; {desc}.")
-    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "none"], default=None,
-                         help="工具调用解析: auto/qwen 解析 <tool_call> 块(请求带 tools 即生效); "
+    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "none"], default=None,
+                         help="工具调用解析: auto/qwen/hermes 解析 <tool_call> 块(请求带 tools "
+                              "即生效; Qwen 与 Hermes 格式相同, vLLM 跑 Qwen3 用 hermes); "
                               "none 关闭. 默认 auto")
     p_serve.add_argument("--enable-auto-tool-choice", action="store_true",
-                         help="兼容 vLLM 参数; 朴素实现在请求带 tools 时始终自动选择, 该参数仅接受")
+                         help="请求带 tools 且未显式给 tool_choice 时默认按 auto 处理"
+                              "(不开启时默认 none, 忽略 tools; 与 vLLM 语义一致)")
     p_serve.add_argument("--reuse-agent-kv", action="store_true",
                          help="agent 模式跨请求前缀 KV 复用(默认关闭): main 在子 agent 返回后"
                               "继续请求时, 复用已保存的子 agent 输出 KV 与前缀历史 KV, 跳过重复"
@@ -100,8 +102,6 @@ def cmd_serve(args: argparse.Namespace) -> None:
     ]:
         if getattr(args, name, None):
             logger.warning("--%s 在朴素实现中不生效: %s", name.replace("_", "-"), desc)
-    if args.enable_auto_tool_choice:
-        logger.warning("--enable-auto-tool-choice 仅作兼容接受: 请求带 tools 时总是自动选择工具")
 
     from .config import EngineConfig
     from .server import run_server
@@ -121,6 +121,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         disable_log_stats=args.disable_log_stats,
         enable_thinking=args.enable_thinking,  # --enable-thinking=True / --no-enable-thinking=False / 缺省 None
         tool_call_parser=args.tool_call_parser or "auto",
+        enable_auto_tool_choice=args.enable_auto_tool_choice,
         reuse_agent_kv=args.reuse_agent_kv,
         reuse_agent_kv_append=args.reuse_agent_kv_append,
         kv_segment_idle_ttl=args.kv_segment_idle_ttl if args.kv_segment_idle_ttl is not None else 3600.0,

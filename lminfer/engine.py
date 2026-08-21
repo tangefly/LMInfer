@@ -439,7 +439,6 @@ class LLMEngine:
                 while generated and generated[-1] in eos_ids:
                     generated.pop()
                 output_text = self.tokenizer.decode(generated, skip_special_tokens=skip_special_tokens)
-
         # ---- 缓存与序列对齐 ----
         # 对齐目标: cache 长度 == n_prompt + len(generated), 否则下一次跨请求
         # 复用的位置会错位(见 kvcache.py 的 put 长度校验). 两种偏差来源:

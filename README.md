@@ -64,9 +64,10 @@ python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 ```
 
 `--served-model-name` 与 vLLM 语义一致（覆盖对外暴露的模型名）；
-`--gpu-memory-utilization`、`--tensor-parallel-size`、`--kv-transfer-config`、
-`--enable-auto-tool-choice`、`--tool-call-parser` 等参数会被接受，
-但朴素实现中不生效（启动时会打印 WARNING 说明原因）。
+`--gpu-memory-utilization`、`--tensor-parallel-size`、`--kv-transfer-config`
+等参数会被接受，但朴素实现中不生效（启动时会打印 WARNING 说明原因）。
+`--tool-call-parser` 与 `--enable-auto-tool-choice` 真实生效，
+见下文 [工具调用](#工具调用原生-tool-call)。
 
 `--reuse-agent-kv` 是 agent 模式下的跨请求 KV 前缀复用开关（默认关闭），
 详见下文 [跨请求 KV 复用](#跨请求-kv-复用--reuse-agent-kv)。
@@ -104,6 +105,62 @@ python examples/bench.py --prompts 8 --max-tokens 64
 | `POST /v1/chat/completions` | 对话补全（支持 stream，支持 agent 模式） |
 | `GET /v1/agent/sessions` | agent 模式会话列表（会话 id / trace / token 累计，朴素实现额外提供） |
 | `GET /v1/stats` | 运行时统计（KV 占用/请求数/吞吐，朴素实现额外提供） |
+
+## 工具调用（原生 tool call）
+
+与 vLLM 的命令完全兼容，可直接照搬 `commands.txt` 里的启动方式：
+
+```bash
+lminfer serve /path/to/model --enable-auto-tool-choice --tool-call-parser hermes
+```
+
+两个参数的语义与 vLLM 一致：
+
+- **`--tool-call-parser`**：`hermes` / `qwen` / `auto`（默认）解析模型输出里的
+  `<tool_call>{"name": ..., "arguments": ...}</tool_call>` 块并转成 OpenAI 格式的
+  `tool_calls` 字段。Qwen 与 Hermes 的格式相同（vLLM 跑 Qwen3 用的就是 hermes
+  parser），三个名字是同一个解析器；`none` 关闭解析，输出按普通文本返回。
+- **`--enable-auto-tool-choice`**：请求带 `tools` 但**未显式给 `tool_choice`** 时，
+  默认按 `auto` 处理；不加该参数时默认 `none`（忽略 tools，模型按普通对话回复）。
+  请求里显式的 `tool_choice` 始终优先，支持 `"auto"` / `"none"` / `"required"` /
+  `{"type": "function", "function": {"name": ...}}`（指定单个函数时只渲染该工具）。
+
+```bash
+# 带 tools 的请求: 模型会输出 <tool_call> 块, 服务端解析为 tool_calls 返回
+# (启动时加了 --enable-auto-tool-choice, tool_choice 可以不写; 不加则必须显式给 "auto")
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "上海天气怎么样?"}],
+       "tools": [{"type": "function", "function": {
+           "name": "get_weather", "description": "查询城市天气",
+           "parameters": {"type": "object",
+                          "properties": {"city": {"type": "string"}},
+                          "required": ["city"]}}}]}'
+
+# 工具执行结果以 tool 消息回传(chat template 渲染成 Qwen3 的 <tool_response> 块)
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [
+        {"role": "user", "content": "上海天气怎么样?"},
+        {"role": "assistant", "content": null,
+         "tool_calls": [{"id": "call_xxx", "type": "function",
+                         "function": {"name": "get_weather",
+                                      "arguments": "{\"city\": \"上海\"}"}}]},
+        {"role": "tool", "tool_call_id": "call_xxx", "content": "晴, 28 度"}],
+       "tools": [...]}'
+```
+
+实现细节与边界（朴素实现刻意保留的部分）：
+
+- 带 `tools` 时生成用 `skip_special_tokens=False` 解码，`<tool_call>` 等特殊 token
+  原样保留供解析；流式响应同样按块拆分，`</tool_call>` 闭合时以 `tool_calls` delta
+  发出，`finish_reason` 为 `"tool_calls"`（与 OpenAI 协议一致）；
+- assistant 的 `tool_calls` 回传时，`arguments` 子串**逐位保留**模型原始输出
+  （不做 JSON 归一化），保证模板二次渲染与生成流一致——这是 agent 模式跨请求
+  KV 前缀复用不断在 `<tool_call>` 块上的前提（见 [跨请求 KV 复用](#跨请求-kv-复用--reuse-agent-kv)）；
+- `tool_choice="required"` 与 `auto` 一样把全部 tools 渲染进模板（本地 Qwen
+  模板没有 required 分支，是否调用由模型自行决定）；
+- **不做 guided decoding**：vLLM 的 tool parser 会按 JSON schema 约束解码保证
+  arguments 合法，朴素实现只解析不约束，JSON 的合法性依赖模型自身（对
+  Qwen3 系模型通常没问题）。
 
 ## Agent 模式（会话追踪）
 

@@ -1,6 +1,7 @@
-"""Qwen 风格工具调用解析(对应 vLLM 的 --tool-call-parser qwen3).
+"""Qwen / Hermes 风格工具调用解析(对应 vLLM 的 --tool-call-parser qwen / hermes).
 
-Qwen2.5/Qwen3 模型在回复中以如下格式输出工具调用:
+Qwen2.5/Qwen3 模型在回复中以如下格式输出工具调用(与 Hermes 格式相同,
+vLLM 跑 Qwen3 用的 hermes parser 解析的就是这个格式):
 
     <tool_call>
     {"name": "get_weather", "arguments": {"city": "Shanghai"}}
