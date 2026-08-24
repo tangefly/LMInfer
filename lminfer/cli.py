@@ -55,9 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("--kv-transfer-config", "朴素实现不接入 KV 传输(如 LMCache)"),
     ]:
         p_serve.add_argument(name, default=None, help=f"兼容 vLLM 参数; {desc}.")
-    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "none"], default=None,
-                         help="工具调用解析: auto/qwen/hermes 解析 <tool_call> 块(请求带 tools "
-                              "即生效; Qwen 与 Hermes 格式相同, vLLM 跑 Qwen3 用 hermes); "
+    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "llama3_json", "none"], default=None,
+                         help="工具调用解析: auto 自动识别模型家族(Qwen/Hermes 系解析 "
+                              "<tool_call> 块, Llama 3.x 系解析 {\"name\":...,\"parameters\":...} "
+                              "JSON); qwen/hermes 强制块解析; llama3_json 强制 JSON 解析; "
                               "none 关闭. 默认 auto")
     p_serve.add_argument("--enable-auto-tool-choice", action="store_true",
                          help="请求带 tools 且未显式给 tool_choice 时默认按 auto 处理"

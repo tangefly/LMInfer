@@ -23,9 +23,18 @@ from fastapi.responses import StreamingResponse
 from .config import EngineConfig, SamplingParams
 from .engine import GenerationResult, LLMEngine
 from .kvcache import KIND_MAIN, KIND_SUB, SessionKVStore
+from .model_adapters import resolve_model_profile
 from .schemas import ChatCompletionRequest, ChatMessage, CompletionRequest
 from .sessions import AgentSessionRegistry
-from .toolcalls import THINK_BLOCK, ToolCallStreamSplitter, clean_content, parse_tool_calls
+from .toolcalls import (
+    THINK_BLOCK,
+    LlamaJsonStreamSplitter,
+    ToolCallStreamSplitter,
+    clean_content,
+    clean_llama3_json_content,
+    parse_llama3_json_tool_calls,
+    parse_tool_calls,
+)
 
 logger = logging.getLogger("lminfer")
 
@@ -46,6 +55,12 @@ def create_app(engine: LLMEngine) -> FastAPI:
 
     # agent 模式会话注册表(服务层状态; handler 都在事件循环上执行, 无需加锁)
     agent_sessions = AgentSessionRegistry()
+    # 模型适配参数: --tool-call-parser auto 在这里解析成具体解析器, 并给出
+    # 模板渲染所需的参数(arguments 还原成 dict / 工具结果包成 {"output": ...})
+    profile = resolve_model_profile(engine.config.tool_call_parser,
+                                    engine.tokenizer, engine.model.config)
+    if engine.config.tool_call_parser == "auto":
+        logger.info("tool-call-parser=auto 自动识别为: %s", profile.tool_parser)
     # 跨请求前缀 KV 复用存储(仅 --reuse-agent-kv / --reuse-agent-kv-append 时使用, 见 kvcache.py)
     # tokenizer 供拼接模式取 <tool_response> 包裹标记的 token id(见 SessionKVStore.build_graft)
     kv_store = SessionKVStore(config=engine.model.config,
@@ -148,6 +163,12 @@ def create_app(engine: LLMEngine) -> FastAPI:
         会回退到下标访问, 对 pydantic 对象则只支持属性访问), 统一转 dict 才能
         适配任意模板; tool_calls / tool_call_id / content(null) 原样透传,
         不遗漏客户端 post 过来的工具调用字段.
+
+        Llama 3.x 适配(profile.arguments_as_dict / wrap_tool_output): 官方模板把
+        OpenAI 格式的 tool_calls.arguments(JSON 字符串)直接 | tojson 会渲染成
+        "parameters": "{\"city\": ...}"(字符串被加引号), 工具结果 content 字符串
+        也会被加引号 —— 渲染前把 arguments 还原成 dict、工具结果包成 {"output": ...}
+        对象, 才能得到模型训练时见到的合法 JSON(与 vLLM 的 llama3.1_json 模板一致).
         """
         out = []
         for m in messages:
@@ -159,10 +180,34 @@ def create_app(engine: LLMEngine) -> FastAPI:
                 content = THINK_BLOCK.sub("", content)
             d = {"role": m.role, "content": content}
             if m.tool_calls is not None:
-                d["tool_calls"] = m.tool_calls
+                d["tool_calls"] = _adapt_tool_calls(m.tool_calls)
             if m.tool_call_id is not None:
                 d["tool_call_id"] = m.tool_call_id
+                if profile.wrap_tool_output and isinstance(d["content"], str):
+                    # Llama 3.x: 工具结果渲染成 {"output": ...} 对象(模板对
+                    # 非字符串内容 | tojson 才不加引号)
+                    d["content"] = {"output": d["content"]}
             out.append(d)
+        return out
+
+    def _adapt_tool_calls(tool_calls: list[dict]) -> list[dict]:
+        """按模型适配参数调整 assistant 消息里的 tool_calls, 供模板渲染.
+
+        Llama 3.x: OpenAI 协议里 arguments 是 JSON 字符串, 模板却按对象渲染
+        (tool_call.arguments | tojson), 需要把字符串解析回 dict; 解析失败则
+        原样保留(模板会渲染成带引号的字符串, 与协议一致, 不报错).
+        """
+        if not profile.arguments_as_dict:
+            return tool_calls
+        out = []
+        for call in tool_calls:
+            fn = call.get("function") or {}
+            if isinstance(fn.get("arguments"), str):
+                try:
+                    fn = {**fn, "arguments": json.loads(fn["arguments"])}
+                except json.JSONDecodeError:
+                    pass
+            out.append({**call, "function": fn})
         return out
 
     def _check_model(model_field: str | None) -> None:
@@ -295,8 +340,13 @@ def create_app(engine: LLMEngine) -> FastAPI:
             if choice not in ("auto", "required"):
                 raise HTTPException(400, f"不支持的 tool_choice: {choice}")
             if not req.tools:
-                raise HTTPException(400, f"tool_choice={choice} 但请求未提供 tools")
-            tools, choice_name = req.tools, choice
+                # vLLM 语义: auto 在无 tools 时退化为普通对话(工具开关不改变
+                # 纯聊天请求的行为); 只有 required 才强制要求 tools
+                if choice == "required":
+                    raise HTTPException(400, f"tool_choice={choice} 但请求未提供 tools")
+                tools = None
+            else:
+                tools, choice_name = req.tools, choice
         else:
             # dict 形式: {"type": "function", "function": {"name": ...}}, 只保留该工具
             name = (choice.get("function") or {}).get("name") if isinstance(choice, dict) else None
@@ -311,8 +361,11 @@ def create_app(engine: LLMEngine) -> FastAPI:
             if not tools:
                 raise HTTPException(400, f"tool_choice 指定的函数 {name} 不在 tools 中")
             choice_name = name
-        # 只有渲染了工具才需要解析 <tool_call> 输出(此时保留特殊 token 供解析)
-        parse_tools = bool(tools) and engine.config.tool_call_parser != "none"
+        # 只有渲染了工具才需要解析工具调用输出(此时保留特殊 token 供解析);
+        # 具体解析器由模型适配层决定(--tool-call-parser auto 自动识别模型家族):
+        #   hermes     : Qwen/Hermes 系, 解析 <tool_call> 块;
+        #   llama3_json: Llama 3.x 系, 解析 {"name":..., "parameters":...} JSON.
+        parse_tools = bool(tools) and profile.tool_parser != "none"
 
         # 用 transformers 的 chat template 把消息列表渲染成 prompt(与参考脚本一致)
         kwargs = {"add_generation_prompt": True, "tokenize": True}
@@ -356,7 +409,8 @@ def create_app(engine: LLMEngine) -> FastAPI:
         req_id = uuid.uuid4().hex[:12]
 
         if req.stream:
-            splitter = ToolCallStreamSplitter() if parse_tools else None
+            splitter = (LlamaJsonStreamSplitter() if profile.tool_parser == "llama3_json"
+                        else ToolCallStreamSplitter()) if parse_tools else None
             queue = await engine.generate(req_id, prompt_ids, sampling, stream=True,
                                           skip_special_tokens=not parse_tools,
                                           reuse_prefixes=reuse_prefixes,
@@ -382,8 +436,15 @@ def create_app(engine: LLMEngine) -> FastAPI:
                                   reuse_prefixes=reuse_prefixes,
                                   graft=graft)
         if parse_tools:
-            tool_calls = parse_tool_calls(r.output_text)
-            content = clean_content(r.output_text) or None
+            if profile.tool_parser == "llama3_json":
+                # Llama 3.x: 模型输出 JSON 工具调用; 有 tool_calls 时 content 为
+                # null(vLLM 语义), 无 tool_calls 时返回文本(剥掉 <|python_tag|> 前缀)
+                tool_calls = parse_llama3_json_tool_calls(r.output_text)
+                content = None if tool_calls else (
+                    clean_llama3_json_content(r.output_text) or None)
+            else:
+                tool_calls = parse_tool_calls(r.output_text)
+                content = clean_content(r.output_text) or None
         else:
             tool_calls, content = [], r.output_text
         message: dict = {"role": "assistant", "content": content}

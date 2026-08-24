@@ -59,6 +59,9 @@ pip install -e .
 lminfer serve /home/tanger/workspace/models/Qwen2.5-7B-Instruct --port 8000
 lminfer serve --model /home/tanger/workspace/models/Qwen3-0.6B --max-num-seqs 4
 
+# Llama 3.1 系(工具调用 JSON 格式自动识别, 无需额外参数)
+lminfer serve /home/tanger/workspace/models/Meta-Llama-3.1-8B-Instruct --port 8000
+
 # 也可以不带参数安装直接运行
 python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 ```
@@ -116,14 +119,39 @@ lminfer serve /path/to/model --enable-auto-tool-choice --tool-call-parser hermes
 
 两个参数的语义与 vLLM 一致：
 
-- **`--tool-call-parser`**：`hermes` / `qwen` / `auto`（默认）解析模型输出里的
-  `<tool_call>{"name": ..., "arguments": ...}</tool_call>` 块并转成 OpenAI 格式的
-  `tool_calls` 字段。Qwen 与 Hermes 的格式相同（vLLM 跑 Qwen3 用的就是 hermes
-  parser），三个名字是同一个解析器；`none` 关闭解析，输出按普通文本返回。
+- **`--tool-call-parser`**：`auto`（默认）按模型 tokenizer 自动识别解析器——
+  - Qwen/Hermes 系（有 `<tool_call>` 特殊 token）走 `hermes`：解析输出里的
+    `<tool_call>{"name": ..., "arguments": ...}</tool_call>` 块并转成 OpenAI 格式的
+    `tool_calls` 字段。Qwen 与 Hermes 的格式相同（vLLM 跑 Qwen3 用的就是 hermes
+    parser），三个名字是同一个解析器；
+  - Llama 3.x 系（有 `<|python_tag|>` 特殊 token）走 `llama3_json`：解析输出里的
+    `{"name": ..., "parameters": ...}` JSON 工具调用（可多个、以 `;` 分隔、周围
+    允许普通文本），对应 vLLM 的 `--tool-call-parser llama3_json`；
+  - 都没有则 `none` 关闭解析，输出按普通文本返回。
+  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `none` 强制使用某解析器。
 - **`--enable-auto-tool-choice`**：请求带 `tools` 但**未显式给 `tool_choice`** 时，
   默认按 `auto` 处理；不加该参数时默认 `none`（忽略 tools，模型按普通对话回复）。
   请求里显式的 `tool_choice` 始终优先，支持 `"auto"` / `"none"` / `"required"` /
   `{"type": "function", "function": {"name": ...}}`（指定单个函数时只渲染该工具）。
+  注意 `"auto"` 在请求没有 `tools` 时退化为普通对话（与 vLLM 一致），只有
+  `"required"` 才强制要求 tools。
+
+### Llama 3.x 的适配点（`lminfer/model_adapters.py`）
+
+Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做了两件事：
+
+1. **JSON 工具调用解析**（`llama3_json`）：模型输出形如
+   `{"name": "get_weather", "parameters": {"city": "上海"}}`（可能带 `<|python_tag|>`
+   前缀，多个调用以 `;` 分隔）。非流式按 `JSONDecoder.raw_decode` 从每个 `{` 解析
+   完整对象（正确处理嵌套与字符串内括号），流式在输出以 `<|python_tag|>` 或 `{`
+   开头时进入 JSON 模式（否则按普通文本透传）；`arguments` 保留模型输出的原始
+   JSON 子串（round-trip 保真）。
+2. **模板渲染适配**：Llama 官方 chat template 把 OpenAI 格式的
+   `tool_calls.arguments`（JSON 字符串）直接 `| tojson`，会渲染成
+   `"parameters": "{\"city\": ...}"`（字符串被加引号）；工具结果字符串也会被加
+   引号。渲染前把 `arguments` 还原成 dict、工具结果包成 `{"output": ...}` 对象
+   （与 vLLM 的 `tool_chat_template_llama3.1_json.jinja` 一致），模型才能读到
+   合法的 JSON。
 
 ```bash
 # 带 tools 的请求: 模型会输出 <tool_call> 块, 服务端解析为 tool_calls 返回
@@ -244,7 +272,8 @@ python experiments/agent_kv_reuse.py --model /path/to/model
 - **复用率取决于 chat template**：模板对同一段历史是否做一致的渲染决定 LCP
   长度。Qwen3 会对**末尾 assistant 消息**插入 `<think>` 块（与后续有 tool
   消息时的渲染不同），导致 LCP 变短（约 30%）；ERNIE 等模板渲染一致，
-  复用率可达 80%+；
+  复用率可达 80%+。Llama 3.1 的模板对历史逐字一致渲染（无 think 块插入），
+  实测复用率 82%–92%（`Meta-Llama-3.1-8B-Instruct`，agent 多轮续接）；
 - **数值等价性**：复用与全量 prefill 数学上等价，但 bf16 精度下存在
   内核级舍入差异（与切换 attention 实现同级，~1e-2 相对误差），贪心输出
   通常逐 token 一致，个别低置信位置可能翻转，属正常现象；
