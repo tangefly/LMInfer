@@ -247,21 +247,8 @@ class LLMEngine:
         graft_mismatch = False
         graft_plan: tuple[int, int, int] | None = None  # (基础复用长度, 插入位置, 子输出长度)
         
-        print("=====[Debug]=====")
-        print(prompt_ids.shape)
-        print(f"use_kv_cache = {use_kv_cache}, graft = {graft}, reuse_prefixes = {reuse_prefixes}")
-        print("=====[Debug]=====")
-        
         if use_kv_cache and graft is not None:
-            # 位置感知拼接模式(实验用途): 子 agent 输出的 KV 由 server 端定位
-            # (KVGraft.position), 直接插进 main 的 KV cache, 跳过这段在 main
-            # 上下文里的重复 prefill.
-            # 结构: [LCP 复用 main 历史 base_len] + prefill [base_len, p)
-            #       + 插入子输出 KV(L 个位置) + prefill [p+L, n)
-            # 正确性守卫(失败安全回退 LCP, 绝不错误拼接):
-            #   1. 插入点 p 必须在 prompt 内(0 < p < n), 且 p+L 不越界;
-            #   2. 子输出 tokens 与 prompt 在 [p, p+L) 逐位一致(位置对齐的前提);
-            #   3. 基础复用段不能越过插入点(base_len <= p).
+            print("\n[复用子 Agent 的输出]\n")
             prompt_list = prompt_ids[0].tolist()
             n = n_prompt
             p, L = graft.position, len(graft.tokens)
