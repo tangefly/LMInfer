@@ -457,6 +457,11 @@ class LLMEngine:
             int(layer.keys.numel() + layer.values.numel()) * layer.keys.element_size()
             for layer in cache.layers if layer.is_initialized
         )
+        
+        print(f"\n[Output] {len(generated)} toks\n")
+        print(output_text)
+        print("")
+        
         result = GenerationResult(
             request_id=request_id,
             prompt_tokens=n_prompt,
