@@ -9,10 +9,13 @@ agent 模式下, 主 agent 调起子 agent, 子 agent 的输出会作为新消�
 做法
 ----
 1. 每个 agent 会话按请求来源保存**完整序列**(prompt + 生成输出)及其 KV cache,
-   要求 KV 与 token 序列逐位对齐、位置从 0 开始 —— **main 段每轮追加全量保留**
-   (直到会话结束), **sub 段保留最新一条**(即"保存好最新的子 Agent 的输出 KV");
+   要求 KV 与 token 序列逐位对齐、位置从 0 开始 —— **main/sub 段都只保留最新
+   一条**(main 每轮覆盖): main 下一轮 prompt 是上一轮完整序列的逐字延续(think
+   由 enable_thinking + chat template 处理, 仅 sub 回填时剥离), 保存段构成嵌套
+   前缀链, 最新段与任意新 prompt 的 LCP 恒 ≥ 旧段, 引擎取最长 LCP 时旧段永不
+   胜出, 无需多段(截断产生的尾锚定段在 server 保存时丢弃);
 2. 新请求到达时由 server 调用 SessionKVStore.propose() 给出候选段(触发条件已放宽:
-   会话内任意请求, main 请求给全部 main 段 + 最新 sub 段, sub 请求给最新 sub 段);
+   会话内任意请求, main 请求给最新 main 段 + 最新 sub 段, sub 请求给最新 sub 段);
 3. 引擎对候选段与新 prompt 做 **token 级最长公共前缀(LCP)匹配**, 只复用
    真正相同的部分, 其余继续 prefill —— 这是正确性的根本保证:
 
@@ -172,16 +175,18 @@ class SessionKVStore:
     """按 agent 会话保存请求的完整序列 KV，供跨请求前缀复用.
 
     保留策略:
-    - **main 段全量保留**: 主 agent 每轮请求的完整序列都追加保存, 直到会话结束
-      (会话闲置超过 idle_ttl 时整段清理) —— 多轮对话中后续每轮都能复用上一轮的
-      prompt KV + 输出 KV;
+    - **main/sub 段都只保留最新一条**(main 请求每轮覆盖): main 下一轮请求的
+      prompt 是上一轮完整序列(模板渲染逐字一致)的延续, 保存段构成嵌套前缀链 ——
+      最新段与任意新 prompt 的 LCP 恒 ≥ 旧段, 引擎对候选取最长 LCP 时旧段
+      永远不可能胜出, 只留最新一条即可; 被截断的请求不保存(尾锚定段无法对齐,
+      见 server._agent_kv_finish);
     - **sub 段保留最新一条**: 只留最近一次 sub 请求的完整序列(含其输出),
-      即"保存好最新的子 Agent 的输出 KV".
+      即"保存好最新的子 Agent 的输出 KV", 供子 agent 多轮续接与拼接模式使用.
     """
 
     def __init__(self, config=None, idle_ttl: float = 3600.0) -> None:
-        # session_id -> {"main": [KVPrefix, ...], "sub": KVPrefix | None}
-        self._segments: dict[str, dict[str, list[KVPrefix] | KVPrefix | None]] = {}
+        # session_id -> {"main": KVPrefix | None, "sub": KVPrefix | None}
+        self._segments: dict[str, dict[str, KVPrefix | None]] = {}
         self._last_seen: dict[str, float] = {}  # session_id -> 最近一次 put 时间(闲置清理用)
         self._idle_ttl = idle_ttl
         self._stats = {"reuse_attempts": 0, "reuse_hits": 0, "reuse_tokens": 0,
@@ -209,7 +214,7 @@ class SessionKVStore:
         seq_tokens 必须与 cache 长度一致(prompt + 输出, 位置从 0 开始),
         否则说明缓存与序列未对齐(理论上不会发生, 防御性检查), 丢弃并告警.
 
-        保留策略: main 段追加保存(每轮一条, 直到会话结束); sub 段替换为最新一条.
+        保留策略: main 段与 sub 段都替换为最新一条(每轮覆盖).
         每次 put 顺带按 idle_ttl 清扫闲置会话段.
 
         prompt_len / think_len: 拼接模式用 —— 记录输出 KV 的起始位置与
@@ -225,13 +230,13 @@ class SessionKVStore:
         now = time.time()
         self._prune_idle(now)
         self._last_seen[session_id] = now
-        segs = self._segments.setdefault(session_id, {"main": [], "sub": None})
+        segs = self._segments.setdefault(session_id, {"main": None, "sub": None})
         prefix = KVPrefix(seq_tokens, cache, output_start=prompt_len,
                           think_len=think_len, kind=kind)
         if kind == KIND_MAIN:
-            segs["main"].append(prefix)  # main 段全量保留(每轮一条)
+            segs["main"] = prefix  # main 段保留最新一条(嵌套前缀链下最新段恒为最长候选)
         else:
-            segs["sub"] = prefix          # sub 段只留最新一条
+            segs["sub"] = prefix   # sub 段只留最新一条
         logger.info("会话 %s: 保存 %s 段 KV %d tok(输出 %d tok, think %d tok) "
                     "供跨请求复用", session_id, kind, len(seq_tokens),
                     len(seq_tokens) - prompt_len, think_len)
@@ -280,7 +285,8 @@ class SessionKVStore:
             return None
 
         # 锚点: 子输出是"新内容", 必然出现在最新 main 段之后
-        min_pos = len(segs["main"][-1].tokens) if segs["main"] else 0
+        main_seg = segs["main"]
+        min_pos = len(main_seg.tokens) if main_seg else 0
         # 最长逐位匹配前缀: 允许开头 1-2 个 token 并入前一标记(边界重分词),
         # 在 [min_pos, len) 内找 (位置, 匹配长度, 跳过前缀长度) 的最优组合
         n, m = len(prompt_tokens), len(body)
@@ -316,7 +322,7 @@ class SessionKVStore:
         """给出可尝试复用的候选段(空列表 = 本次不尝试).
 
         触发条件已放宽(不再限定"main 在子 agent 返回后继续"): 只要会话里有
-        已保存的段就给出候选 —— main 请求给全部 main 段(每轮一条) + 最新 sub 段,
+        已保存的段就给出候选 —— main 请求给最新 main 段 + 最新 sub 段,
         sub 请求给最新 sub 段(同一 sub 的多轮续接)。具体能否复用、复用多少
         由引擎的 LCP 匹配决定(前缀不一致自动回退全量 prefill, 零风险).
         """
@@ -325,9 +331,11 @@ class SessionKVStore:
             return []
         self._stats["reuse_attempts"] += 1
         if trace and trace[-1] == KIND_MAIN:
-            candidates: list[KVPrefix] = list(segs["main"])
+            candidates: list[KVPrefix] = []
+            if segs["main"] is not None:
+                candidates.append(segs["main"])  # 最新 main 段(含其输出 KV)
             if segs["sub"] is not None:
-                candidates.append(segs["sub"])  # 最新 sub 段(含其输出 KV)
+                candidates.append(segs["sub"])   # 最新 sub 段(含其输出 KV)
             return candidates
         if segs["sub"] is not None:
             return [segs["sub"]]  # sub 请求: 该 sub 最近一轮的段(续接时可复用)

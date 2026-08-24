@@ -246,6 +246,12 @@ class LLMEngine:
         reuse_len = 0
         graft_mismatch = False
         graft_plan: tuple[int, int, int] | None = None  # (基础复用长度, 插入位置, 子输出长度)
+        
+        print("=====[Debug]=====")
+        print(prompt_ids.shape)
+        print(f"use_kv_cache = {use_kv_cache}, graft = {graft}, reuse_prefixes = {reuse_prefixes}")
+        print("=====[Debug]=====")
+        
         if use_kv_cache and graft is not None:
             # 位置感知拼接模式(实验用途): 子 agent 输出的 KV 由 server 端定位
             # (KVGraft.position), 直接插进 main 的 KV cache, 跳过这段在 main

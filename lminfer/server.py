@@ -25,7 +25,7 @@ from .engine import GenerationResult, LLMEngine
 from .kvcache import KIND_MAIN, KIND_SUB, SessionKVStore
 from .schemas import ChatCompletionRequest, ChatMessage, CompletionRequest
 from .sessions import AgentSessionRegistry
-from .toolcalls import ToolCallStreamSplitter, clean_content, parse_tool_calls
+from .toolcalls import THINK_BLOCK, ToolCallStreamSplitter, clean_content, parse_tool_calls
 
 logger = logging.getLogger("lminfer")
 
@@ -149,7 +149,13 @@ def create_app(engine: LLMEngine) -> FastAPI:
         """
         out = []
         for m in messages:
-            d = {"role": m.role, "content": m.content}
+            content = m.content
+            # 历史 assistant 消息里的 think 块在渲染前剔除: 返回文本保留 think(见
+            # clean_content), 但思考内容重新进入 prompt 会让 Qwen3 后续生成退化
+            # (不闭合 think 就调工具/空思考+答非所问), 渲染期剥掉与 vLLM 行为一致
+            if m.role == "assistant" and isinstance(content, str):
+                content = THINK_BLOCK.sub("", content)
+            d = {"role": m.role, "content": content}
             if m.tool_calls is not None:
                 d["tool_calls"] = m.tool_calls
             if m.tool_call_id is not None:
@@ -186,9 +192,9 @@ def create_app(engine: LLMEngine) -> FastAPI:
                          r: GenerationResult, attempted: bool) -> None:
         """agent 请求生成结束后: 累计复用统计, 并保存本次完整序列 KV.
 
-        保存的序列 = 实际 prefill 的 prompt(截断后) + 生成输出, 与 KV cache
-        逐位对齐、位置从 0 开始 —— 下一次请求(main 从子 agent 返回后)即可
-        作为前缀复用候选.
+        保存的序列 = 实际 prefill 的 prompt + 生成输出, 与 KV cache 逐位对齐、
+        位置从 0 开始 —— 下一次请求即可作为前缀复用候选. 被截断的请求不保存
+        (尾锚定段与下一轮完整历史无法对齐, 且会覆盖之前保存的好段).
         """
         if r.reused_prompt_tokens > 0:
             kv_store.note_hit(r.reused_prompt_tokens)
@@ -206,6 +212,12 @@ def create_app(engine: LLMEngine) -> FastAPI:
             return
         if r.kv_graft_mismatch:
             kv_store.note_graft_mismatch()
+        # 被截断的请求不保存: 保存段尾锚定(从截断点起), 与下一轮完整历史的头部
+        # 必然错位, 永远无法作为前缀复用 —— 单槽位 store 下还会覆盖之前的好段
+        if prompt_ids.shape[1] > r.prompt_tokens:
+            logger.info("请求 %s: prompt 被截断(%d -> %d tok), 跳过 KV 保存",
+                        r.request_id, prompt_ids.shape[1], r.prompt_tokens)
+            return
         seq_tokens = prompt_ids[0][-r.prompt_tokens:].tolist() + r.output_tokens
         kind = KIND_MAIN if trace[-1] == KIND_MAIN else KIND_SUB
         # prompt_len/think_len 用于拼接模式: 记录输出 KV 起始位置与开头

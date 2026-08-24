@@ -21,7 +21,11 @@ TOOL_CALL_START = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
 # 两个标记都是特殊 token, 解码后原样出现; 但保险起见仍按子串匹配
 TOOL_CALL_BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
-THINK_START, THINK_END = "<think>", "</think>"
+THINK_START, THINK_END = "<think>", "</think>"  # engine.py 用于 think_len 统计
+# 整个 <think>...</think> 块: 返回文本中保留(客户端可自行剥离);
+# 但历史 assistant 消息回传渲染时需剔除(见 server._message_dicts)——
+# 思考内容重新进 prompt 会让 Qwen3 后续生成退化(不闭合 think 就调工具/答非所问)
+THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 def _match_json_value(text: str, start: int) -> str | None:
@@ -156,9 +160,12 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
 
 
 def clean_content(text: str) -> str:
-    """去掉 <tool_call> 块与 <think>/</think> 标记, 得到应返回的 content 文本."""
+    """去掉 <tool_call> 块(已解析为 tool_calls), 其余内容原样返回.
+
+    <think>...</think> 思考块(含标签)保留在 content 中, 供需要观测思考过程的
+    客户端直接使用; 需要剥离的客户端(如 ToyAgent 的 _strip_think)按标签自行处理.
+    """
     text = TOOL_CALL_BLOCK.sub("", text)
-    text = text.replace(THINK_START, "").replace(THINK_END, "")
     return text.strip()
 
 
@@ -167,7 +174,8 @@ class ToolCallStreamSplitter:
 
     行为:
       - <tool_call>...</tool_call> 整块不进入 content, 块内 JSON 解析成工具调用;
-      - <think>/</think> 标记直接丢弃, 思考内容仍作为 content 透传(与非流式一致);
+      - <think>...</think> 思考块视为普通文本, 连同标签原样透传进 content
+        (开启 think 时思考内容不丢弃, 由客户端决定是否剥离);
       - 流结束时未闭合的块按普通文本返回(模型没写完就当文本);
       - 标记即使被拆成多个 chunk 到达也能正确识别(每个状态只保留可能
         是不完整标记的尾部, 其余内容立即输出).
@@ -178,12 +186,9 @@ class ToolCallStreamSplitter:
 
     def __init__(self) -> None:
         self._buf = ""
-        self._state = "normal"  # normal / in_think / in_tool_call
+        self._state = "normal"  # normal / in_tool_call
 
     def _emit_content(self, events: List[Tuple[str, Any]], text: str) -> None:
-        # 正常状态下不会出现 <think> 开标记(它已进入 in_think 状态);
-        # 这里只清理游离的 </think> 闭标记(模型输出不配对时的兜底)
-        text = text.replace(THINK_END, "")
         if text:
             events.append(("content", text))
 
@@ -208,38 +213,20 @@ class ToolCallStreamSplitter:
                 self._buf = self._buf[end + len(TOOL_CALL_END):]
                 self._state = "normal"
                 continue
-            if self._state == "in_think":
-                end = self._buf.find(THINK_END)
-                if end == -1:
-                    # 把可能是 </think> 前缀的尾部留下, 其余思考内容输出
-                    emit_len = max(len(self._buf) - (len(THINK_END) - 1), 0)
-                    if emit_len:
-                        self._emit_content(events, self._buf[:emit_len])
-                        self._buf = self._buf[emit_len:]
-                    break
-                # 思考内容照常输出, 只丢弃 </think> 标记本身
-                self._emit_content(events, self._buf[:end])
-                self._buf = self._buf[end + len(THINK_END):]
-                self._state = "normal"
-                continue
-            # normal: 找下一个开标记(取先出现的)
+            # normal: 只拦截 <tool_call> 开标记, <think> 等其余文本原样输出
             call_pos = self._buf.find(TOOL_CALL_START)
-            think_pos = self._buf.find(THINK_START)
-            if call_pos == -1 and think_pos == -1:
-                hold = max(len(TOOL_CALL_START), len(THINK_START)) - 1
+            if call_pos == -1:
+                hold = len(TOOL_CALL_START) - 1
                 emit_len = max(len(self._buf) - hold, 0)
                 if emit_len:
                     self._emit_content(events, self._buf[:emit_len])
                     self._buf = self._buf[emit_len:]
                 break
-            if think_pos != -1 and (call_pos == -1 or think_pos < call_pos):
-                self._switch(events, THINK_START, "in_think")
-            else:
-                self._switch(events, TOOL_CALL_START, "in_tool_call")
+            self._switch(events, TOOL_CALL_START, "in_tool_call")
         return events
 
     def flush(self) -> List[Tuple[str, Any]]:
-        """流结束收尾: 未闭合的 <think>/<tool_call> 块按普通文本返回."""
+        """流结束收尾: 未闭合的块按普通文本返回."""
         events: List[Tuple[str, Any]] = []
         self._emit_content(events, self._buf)
         self._buf = ""
