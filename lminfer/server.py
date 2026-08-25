@@ -384,8 +384,6 @@ def create_app(engine: LLMEngine) -> FastAPI:
             new_kwargs = kwargs.copy()
             new_kwargs["tokenize"] = False
             text_prompt = engine.tokenizer.apply_chat_template(_message_dicts(req.messages), **new_kwargs)
-            print(f"\n[Receive] {len(ids.input_ids)} toks \n")
-            print(text_prompt)
         except Exception as e:  # 模板缺参数、模板不支持 tools 等
             raise HTTPException(400, f"chat template 渲染失败: {e}")
         if hasattr(ids, "input_ids"):  # transformers 5.x 返回 tokenizers.Encoding
