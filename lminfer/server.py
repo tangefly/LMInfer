@@ -480,9 +480,18 @@ def create_app(engine: LLMEngine) -> FastAPI:
             **engine._stats,
             "kv_reuse": kv_store.stats,
         }
+        
+    @app.post("/v1/release")
+    async def release(req: dict):
+        if "session_id" not in req:
+            logger.info("release 请求不含 session_id 字段")
+            return {"state": False}
+        if req["session_id"] is None:
+            return {"state": False}
+        kv_store.release(req["session_id"])
+        return {"state": True}
 
     return app
-
 
 def run_server(config: EngineConfig, host: str = "0.0.0.0", port: int = 8000):
     """加载引擎并启动 uvicorn(供 cli 调用)."""

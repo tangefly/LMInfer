@@ -237,6 +237,15 @@ class SessionKVStore:
         for sid in stale:
             del self._segments[sid]
             del self._last_seen[sid]
+            
+    def release(self, session_id: str) -> None:
+        """根据指定的 session_id 清理显存"""
+        if session_id in self._segments:
+            del self._segments[session_id]
+        if session_id in self._last_seen:
+            del self._last_seen[session_id]
+        
+        logger.info(f"释放 {session_id} 的显存")
 
     def put(self, session_id: str, kind: str, seq_tokens: list[int],
             cache: DynamicCache, prompt_len: int = 0,
