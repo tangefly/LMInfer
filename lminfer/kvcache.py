@@ -109,16 +109,10 @@ class KVGraft:
     - cache   : 与 tokens 对齐的 KV(子 agent 请求输出段的深拷贝).
     """
 
-    position: int
-    tokens: list[int]
-    cache: DynamicCache
-
-    tokens: list[int]        # 该段 KV 覆盖的 token id 序列(prompt + 输出)
-    cache: DynamicCache      # 与 tokens 严格对齐的 KV cache
-    output_start: int = 0    # 输出 KV 的起始位置(= prompt 长度)
-    think_len: int = 0       # 输出开头 <think> 块的 token 数(拼接时剔除)
-    kind: str = ""           # 段来源(KIND_MAIN / KIND_SUB), 供引擎日志区分复用的
-                             # 是子 agent 输出 KV 还是 main 历史 KV
+    position: int            # 子输出正文 tokens 在 main prompt 中的起始位置
+    tokens: list[int]        # 与 cache 逐位对齐的子输出连续段
+    cache: DynamicCache      # 与 tokens 对齐的子输出 KV cache
+    source_position: int = 0  # 该 KV 在子 agent 序列中的原始起始位置(RoPE rebase 用)
 
 
 def slice_cache(cache: DynamicCache, length: int,
@@ -155,6 +149,61 @@ def tail_cache(cache: DynamicCache, start: int, config) -> DynamicCache:
         (layer.keys[:, :, start:].clone(), layer.values[:, :, start:].clone())
         for layer in cache.layers
     ]
+    return DynamicCache(ddp_cache_data=layers, config=config)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Qwen/Llama-style RoPE half rotation."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
+                        device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build cos/sin for RoPE position delta.
+
+    Existing K cache has already been rotated at source positions. Because RoPE
+    rotations compose, rotating by (target_position - source_position) maps it
+    to the target position for default Qwen/Llama RoPE.
+    """
+    rope_params = getattr(config, "rope_parameters", None) or {}
+    theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000.0))
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+    )
+    positions = torch.full((length,), float(delta), device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+
+
+def rebase_rope_cache(cache: DynamicCache, source_start: int, target_start: int,
+                      config) -> DynamicCache:
+    """Deep-copy `cache` and rebase K RoPE positions from source to target.
+
+    Only K carries RoPE; V is cloned unchanged. This corrects position mismatch
+    for grafted sub-agent output KV, but it does not fix the different-context
+    hidden-state gap. The implementation targets default Qwen/Llama-style RoPE.
+    """
+    delta = target_start - source_start
+    if delta == 0:
+        return slice_cache(cache, cache.get_seq_length(), config)
+    for layer in cache.layers:
+        if not layer.is_initialized:
+            raise ValueError("rebase_rope_cache: 存在未初始化的缓存层, 无法重映射")
+    layers = []
+    for layer in cache.layers:
+        keys = layer.keys.clone()
+        values = layer.values.clone()
+        length = keys.shape[-2]
+        head_dim = keys.shape[-1]
+        cos, sin = _rope_delta_cos_sin(length, delta, head_dim, config,
+                                       keys.device, keys.dtype)
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+        keys = (keys * cos) + (_rotate_half(keys) * sin)
+        layers.append((keys, values))
     return DynamicCache(ddp_cache_data=layers, config=config)
 
 
@@ -397,7 +446,8 @@ class SessionKVStore:
                     "think_len %d, prompt 位置 %d..%d, 头部漂移 %d tok), 准备插入",
                     session_id, best_k, best_j, sub_seg.think_len,
                     pos, pos + best_k - 1, best_i)
-        return KVGraft(position=pos, tokens=tokens, cache=cache)
+        return KVGraft(position=pos, tokens=tokens, cache=cache,
+                       source_position=sub_seg.output_start + best_j)
 
     def propose(self, session_id: str, trace: list[str]) -> list[KVPrefix]:
         """给出可尝试复用的候选段(空列表 = 本次不尝试).
