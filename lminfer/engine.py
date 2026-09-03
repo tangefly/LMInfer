@@ -45,6 +45,7 @@ from .kvcache import (
     longest_common_prefix,
     rebase_rope_cache,
     slice_cache,
+    tail_cache,
 )
 from .toolcalls import THINK_END, THINK_START
 
@@ -207,7 +208,7 @@ class LLMEngine:
         on_token: Callable[[int], None] | None = None,  # 每生成一个 token 回调(流式输出用)
         skip_special_tokens: bool = True,  # False 用于工具调用: 保留 <tool_call> 等标记供解析
         reuse_prefixes: list[KVPrefix] | None = None,  # 跨请求前缀 KV 复用候选(agent 模式, LCP 安全)
-        graft: KVGraft | None = None,  # 位置感知拼接: 把子 agent 输出 KV 插入 main prompt 指定位置
+        graft: KVGraft | list[KVGraft] | None = None,  # 位置感知拼接: 插入一个或多个 sub 输出 KV
     ) -> GenerationResult:
         """prefill + decode 的生成循环, 返回完整结果.
 
@@ -220,9 +221,8 @@ class LLMEngine:
           最长公共前缀匹配, 只复用真正相同的部分, 不匹配时安全回退全量 prefill;
         - graft         : 位置感知拼接模式(实验)。子 agent 输出的 KV 由 server 端
           定位到其在 prompt 中的位置(KVGraft.position), 引擎先 LCP 复用 main
-          历史 KV, prefill 到插入点后把子输出 KV 直接插进 cache, 再 prefill 剩余
-          部分 —— 跳过子输出这段在 main 上下文里的重复 prefill. 插入位置/长度/
-          token 逐位校验, 失败自动回退 LCP 模式(绝不错误拼接).
+          历史 KV, 再按位置顺序 prefill 间隙并插入一个或多个子输出 KV。
+          插入位置/长度/token 逐位校验, 失败自动回退 LCP 模式(绝不错误拼接).
           注意: 子输出 KV 是在子 agent 自己的上下文里计算的, 插入 main 上下文
           后注意力结果与全量 prefill 存在近似差异(实验用途).
         """
@@ -246,53 +246,61 @@ class LLMEngine:
         # 最后 1 个 token 就能拿到它的 logits, 同样成立.
         reuse_len = 0
         graft_mismatch = False
-        graft_plan: tuple[int, int, int, int, int] | None = None
-        # (基础复用长度, 插入位置, 子输出长度, repair_left, repair_right)
-        
-        if use_kv_cache and graft is not None:
-            print("\n[复用子 Agent 的输出]\n")
-            prompt_list = prompt_ids[0].tolist()
-            n = n_prompt
-            p, L = graft.position, len(graft.tokens)
-            repair_n = max(0, self.config.graft_recompute_window)
-            repair_left = max(0, p - repair_n) if repair_n else p
-            repair_right = min(n, p + L + repair_n) if repair_n else p + L
-            reuse_cap = repair_left if repair_n else p
-            # 基础段: 与 LCP 模式相同的候选选择, 但封顶在复用上限。
-            # repair 开启时窗口内必须在 main 上下文重算, 不能从旧 cache 继承。
-            base_len, base_cache = 0, None
-            for prefix in sorted(reuse_prefixes,
+        graft_plan: tuple[int, list[KVGraft], int, int] | None = None
+        # (基础复用长度, graft 列表, repair_left, repair_right)
+        prompt_list = prompt_ids[0].tolist()
+
+        def _best_prefix(cap: int = n_prompt) -> tuple[int, DynamicCache | None, KVPrefix | None]:
+            best_len, best_cache, best_prefix = 0, None, None
+            for prefix in sorted(reuse_prefixes or [],
                                  key=lambda pr: len(pr.tokens), reverse=True):
-                m = min(longest_common_prefix(prompt_list, prefix.tokens), reuse_cap)
-                if m > base_len:
-                    base_len, base_cache = m, prefix.cache
-                if base_len == min(len(prefix.tokens), reuse_cap):
+                m = min(longest_common_prefix(prompt_list, prefix.tokens), cap)
+                if m > best_len:
+                    best_len, best_cache, best_prefix = m, prefix.cache, prefix
+                if best_len == min(len(prefix.tokens), cap):
                     break
-            if not (0 < p < n and p + L <= n and base_len <= reuse_cap
-                    and prompt_list[p:p + L] == graft.tokens):
+            return best_len, best_cache, best_prefix
+
+        grafts: list[KVGraft] = []
+        if graft is not None:
+            grafts = graft if isinstance(graft, list) else [graft]
+            grafts = sorted(grafts, key=lambda g: g.position)
+
+        if use_kv_cache and grafts:
+            print("\n[复用子 Agent 的输出]\n")
+            n = n_prompt
+            repair_n = max(0, self.config.graft_recompute_window)
+            first_p = grafts[0].position
+            last_end = max(g.position + len(g.tokens) for g in grafts)
+            repair_left = max(0, first_p - repair_n) if repair_n else first_p
+            repair_right = min(n, last_end + repair_n) if repair_n else last_end
+            reuse_cap = repair_left if repair_n else first_p
+            base_len, base_cache, _base_prefix = _best_prefix(reuse_cap)
+
+            valid = base_len <= reuse_cap
+            prev_end = -1
+            for item in grafts:
+                p, L = item.position, len(item.tokens)
+                if not (0 < p < n and L > 0 and p + L <= n and prev_end <= p
+                        and prompt_list[p:p + L] == item.tokens):
+                    valid = False
+                    break
+                prev_end = p + L
+            if not valid:
                 graft_mismatch = True
+                best_len, best_cache, _best_prefix_obj = _best_prefix(n_prompt)
                 logger.warning(
-                    "请求 %s: 拼接结构校验失败(插入位置 %d, 子输出 %d tok), "
-                    "回退 LCP 复用 %d tok", request_id, p, L, base_len)
-                reuse_len = min(base_len, n - 1)
+                    "请求 %s: 多段拼接结构校验失败(%d 段), 回退 LCP 复用 %d tok",
+                    request_id, len(grafts), best_len)
+                reuse_len = min(best_len, n_prompt - 1)
                 if reuse_len > 0:
-                    cache = slice_cache(base_cache, reuse_len, self.model.config)
+                    cache = slice_cache(best_cache, reuse_len, self.model.config)
             else:
-                graft_plan = (base_len, p, L, repair_left, repair_right)
+                graft_plan = (base_len, grafts, repair_left, repair_right)
                 if base_len > 0:
                     cache = slice_cache(base_cache, base_len, self.model.config)
         elif use_kv_cache and reuse_prefixes:
-            prompt_list = prompt_ids[0].tolist()
-            best_len, best_cache, best_prefix = 0, None, None
-            # 候选按长度降序: 当前候选全长命中即短路(更长的候选不存在, 更短的
-            # 候选 LCP 不可能超过自身长度), 避免长会话里逐段比较的开销
-            for prefix in sorted(reuse_prefixes,
-                                 key=lambda p: len(p.tokens), reverse=True):
-                m = longest_common_prefix(prompt_list, prefix.tokens)
-                if m > best_len:
-                    best_len, best_cache, best_prefix = m, prefix.cache, prefix
-                if best_len == len(prefix.tokens):
-                    break
+            best_len, best_cache, best_prefix = _best_prefix(n_prompt)
             if best_len > 0:
                 # 必须深拷贝切片: transformers 的 DynamicCache.update 原地拼接,
                 # 直接把已保存的缓存传给生成循环会污染 store 里的对象
@@ -355,66 +363,68 @@ class LLMEngine:
             # 若子输出正好到 prompt 末尾, 用最后 1 个 token 的前向拿 logits
             # (与 LCP 整段命中的处理一致), 此时 cache 长度 n-1, 前向后补到 n.
             if graft_plan is not None:
-                base_len, p, L, repair_left, repair_right = graft_plan
+                base_len, plan_grafts, _repair_left, _repair_right = graft_plan
                 device = self.model.device
-                if self.config.graft_recompute_window > 0:
-                    if repair_left > base_len:
+                repair_n = max(0, self.config.graft_recompute_window)
+                total_graft_tokens = sum(len(g.tokens) for g in plan_grafts)
+                first_p = plan_grafts[0].position
+                last_end = max(g.position + len(g.tokens) for g in plan_grafts)
+                cur = base_len
+                skipped = base_len
+                grafted_segments = 0
+                grafted_tokens = 0
+                for item in plan_grafts:
+                    p, L = item.position, len(item.tokens)
+                    left_trim = min(repair_n, L)
+                    right_trim = min(repair_n, max(0, L - left_trim))
+                    graft_start = p + left_trim
+                    graft_len = L - left_trim - right_trim
+                    if graft_len <= 0:
+                        continue
+                    if graft_start > cur:
                         out = self.model(
-                            input_ids=prompt_ids[:, base_len:repair_left],
-                            attention_mask=torch.ones(1, repair_left, device=device),
+                            input_ids=prompt_ids[:, cur:graft_start],
+                            attention_mask=torch.ones(1, graft_start, device=device),
                             past_key_values=cache, use_cache=True,
                         )
-                    out = self.model(
-                        input_ids=prompt_ids[:, repair_left:repair_right],
-                        attention_mask=torch.ones(1, repair_right, device=device),
-                        past_key_values=cache, use_cache=True,
-                    )
-                    if repair_right < n_prompt:
-                        out = self.model(
-                            input_ids=prompt_ids[:, repair_right:],
-                            attention_mask=torch.ones(1, n_prompt, device=device),
-                            past_key_values=cache, use_cache=True,
-                        )
-                    reuse_len = min(base_len, n_prompt - 1)
-                    logger.info(
-                        "请求 %s: 重算 graft 修正窗口 %d..%d(含子输出 %d..%d), "
-                        "复用 main 历史 KV %d tok, 剩余 %d tok prefill",
-                        request_id, repair_left, repair_right - 1, p, p + L - 1,
-                        base_len, n_prompt - reuse_len)
-                else:
-                    if p > base_len:
-                        out = self.model(
-                            input_ids=prompt_ids[:, base_len:p],
-                            attention_mask=torch.ones(1, p, device=device),
-                            past_key_values=cache, use_cache=True,
-                        )
-                    graft_cache = graft.cache
+                    graft_cache = slice_cache(
+                        item.cache, graft_len + left_trim, self.model.config)
+                    graft_cache = slice_cache(
+                        tail_cache(graft_cache, left_trim, self.model.config),
+                        graft_len, self.model.config)
                     if self.config.graft_rope_rebase:
                         graft_cache = rebase_rope_cache(
-                            graft.cache, graft.source_position, p, self.model.config)
+                            graft_cache, item.source_position + left_trim,
+                            graft_start, self.model.config)
                     # 插入子输出 KV: concat 产生新对象, 后续原地拼接不会污染 store
                     cache = concat_cache(cache, graft_cache, self.model.config)
-                    if p + L < n_prompt:
-                        out = self.model(
-                            input_ids=prompt_ids[:, p + L:],
-                            attention_mask=torch.ones(1, n_prompt, device=device),
-                            past_key_values=cache, use_cache=True,
-                        )
-                        reuse_len = base_len + L  # 跳过 prefill: 基础段 + 子输出
-                    else:
-                        cache = slice_cache(cache, n_prompt - 1, self.model.config)
-                        out = self.model(
-                            input_ids=prompt_ids[:, n_prompt - 1:],
-                            attention_mask=torch.ones(1, n_prompt, device=device),
-                            past_key_values=cache, use_cache=True,
-                        )
-                        reuse_len = base_len + L - 1  # 最后 1 个 token 需要前向
-                    rebase_note = " + RoPE rebase" if self.config.graft_rope_rebase else ""
-                    logger.info(
-                        "请求 %s: 拼接子 agent 输出 KV %d tok(位置 %d..%d)%s + 复用 "
-                        "main 历史 KV %d tok, 剩余 %d tok prefill",
-                        request_id, L, p, p + L - 1, rebase_note, base_len,
-                        n_prompt - reuse_len)
+                    cur = graft_start + graft_len
+                    skipped += graft_len
+                    grafted_segments += 1
+                    grafted_tokens += graft_len
+                if cur < n_prompt:
+                    out = self.model(
+                        input_ids=prompt_ids[:, cur:],
+                        attention_mask=torch.ones(1, n_prompt, device=device),
+                        past_key_values=cache, use_cache=True,
+                    )
+                    reuse_len = skipped
+                else:
+                    cache = slice_cache(cache, n_prompt - 1, self.model.config)
+                    out = self.model(
+                        input_ids=prompt_ids[:, n_prompt - 1:],
+                        attention_mask=torch.ones(1, n_prompt, device=device),
+                        past_key_values=cache, use_cache=True,
+                    )
+                    reuse_len = max(0, skipped - 1)  # 最后 1 个 token 需要前向拿 logits
+                rebase_note = " + RoPE rebase" if self.config.graft_rope_rebase else ""
+                repair_note = (f", 每段边界重算 {repair_n} tok" if repair_n else "")
+                logger.info(
+                    "请求 %s: 拼接子 agent 输出 KV %d/%d 段, %d/%d tok(位置 %d..%d)%s%s + "
+                    "复用 main 历史 KV %d tok, 剩余 %d tok prefill",
+                    request_id, grafted_segments, len(plan_grafts), grafted_tokens,
+                    total_graft_tokens, first_p, last_end - 1, rebase_note, repair_note,
+                    base_len, n_prompt - reuse_len)
             else:
                 out = self.model(
                     input_ids=prompt_ids[:, reuse_len:],
@@ -531,7 +541,7 @@ class LLMEngine:
                        sampling: SamplingParams, stream: bool = False,
                        skip_special_tokens: bool = True,
                        reuse_prefixes: list[KVPrefix] | None = None,
-                       graft: KVGraft | None = None):
+                       graft: KVGraft | list[KVGraft] | None = None):
         """异步生成.
 
         返回:

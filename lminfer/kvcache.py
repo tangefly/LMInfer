@@ -9,13 +9,15 @@ agent 模式下, 主 agent 调起子 agent, 子 agent 的输出会作为新消�
 做法
 ----
 1. 每个 agent 会话按请求来源保存**完整序列**(prompt + 生成输出)及其 KV cache,
-   要求 KV 与 token 序列逐位对齐、位置从 0 开始 —— **main/sub 段都只保留最新
-   一条**(main 每轮覆盖): main 下一轮 prompt 是上一轮完整序列的逐字延续(think
-   由 enable_thinking + chat template 处理, 仅 sub 回填时剥离), 保存段构成嵌套
-   前缀链, 最新段与任意新 prompt 的 LCP 恒 ≥ 旧段, 引擎取最长 LCP 时旧段永不
-   胜出, 无需多段(截断产生的尾锚定段在 server 保存时丢弃);
+   要求 KV 与 token 序列逐位对齐、位置从 0 开始。main 段只保留最新一条;
+   sub 段按 trace_key 保留“最新 main 之后”的每次 sub invocation。一次 sub
+   invocation 内部可能有多轮模型调用, 但只覆盖保存为最新一整段 KV；多个并行/
+   连续 sub invocation 则各保留一段, 直到下一次 main 完成后清空。这样
+   `main -> {sub, sub, sub} -> main` 的最终 main 能一次性定位并复用多个子
+   agent 输出 KV;
 2. 新请求到达时由 server 调用 SessionKVStore.propose() 给出候选段(触发条件已放宽:
-   会话内任意请求, main 请求给最新 main 段 + 最新 sub 段, sub 请求给最新 sub 段);
+   会话内任意请求, main 请求给最新 main 段 + 最新 main 后的 sub 段, sub 请求给
+   最近 sub 段);
 3. 引擎对候选段与新 prompt 做 **token 级最长公共前缀(LCP)匹配**, 只复用
    真正相同的部分, 其余继续 prefill —— 这是正确性的根本保证:
 
@@ -25,22 +27,22 @@ agent 模式下, 主 agent 调起子 agent, 子 agent 的输出会作为新消�
    assistant 消息插入 <think> 块)都会让 LCP 提前停止, 安全回退到全量 prefill,
    绝不会产生错误结果。
 
-4. 位置感知拼接(build_graft, 实验): 子 agent 的输出作为 tool 结果回填进 main
+4. 位置感知拼接(build_grafts, 实验): 子 agent 的输出作为 tool 结果回填进 main
    的下一轮 prompt 时, 其 token 由 chat template 重新渲染(正文前后带 role 标记,
    如 Qwen3 的 <tool_response> 包裹), 不构成任何已保存段的公共前缀, LCP 模式
    无法复用。拼接模式利用 <tool_response> 包裹标记(特殊 token, id 与上下文
    无关)在渲染后的 prompt 中**锚定正文所在窗口**, 再把窗口与子请求保存的输出
-   序列逐位对齐(正文可能写在 think 块内/外, 见 SessionKVStore.build_graft),
+   序列逐位对齐(正文可能写在 think 块内/外, 见 SessionKVStore.build_grafts),
    把子 agent 请求时算好的输出 KV 直接插入 main 的 KV cache 对应位置 ——
    窗口外的包裹标记由引擎照常 prefill, 跳过的是正文这段的重复 prefill。
    注意: 该 KV 在子 agent 自己的上下文里计算, 插入 main 上下文后注意力结果
-   与全量 prefill 存在**近似差异**(实验用途, 见 KVGraft/build_graft);
+   与全量 prefill 存在**近似差异**(实验用途, 见 KVGraft/build_grafts);
    定位失败时安全回退 LCP 模式。
 
 5. 复用段必须**深拷贝**(slice_cache/tail_cache)后交给生成循环: transformers 的
    DynamicCache.update 是原地拼接, 直接传会让后续请求污染已保存的缓存.
 
-并发说明: propose / build_graft / put 都发生在 asyncio 事件循环上(与
+并发说明: propose / build_grafts / put 都发生在 asyncio 事件循环上(与
 AgentSessionRegistry 相同), 无需加锁; 生成循环线程只持有深拷贝的 cache,
 不会触碰 store 里的对象.
 """
@@ -48,6 +50,7 @@ AgentSessionRegistry 相同), 无需加锁; 生成循环线程只持有深拷贝
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from transformers import DynamicCache
@@ -63,7 +66,7 @@ KIND_SUB = "sub"     # 子 agent 请求的完整序列(含其输出, 即"子 age
 TOOL_RESPONSE_OPEN = "<tool_response>"
 TOOL_RESPONSE_CLOSE = "</tool_response>"
 
-# 拼接模式定位参数(见 SessionKVStore.build_graft):
+# 拼接模式定位参数(见 SessionKVStore.build_grafts):
 GRAFT_HEAD_SLACK = 2    # 窗口内对齐时允许的首部总漂移 token 数(边界 token 与
                         # 正文首个 token 合并 / 客户端剥离首部空白)
 GRAFT_WINDOW_SLACK = 8  # 包裹标记间窗口长度超出正文长度的容忍上限; 超出说明
@@ -91,6 +94,7 @@ class KVPrefix:
     think_len: int = 0       # 输出开头 <think> 块的 token 数(拼接时剔除)
     kind: str = ""           # 段来源(KIND_MAIN / KIND_SUB), 供引擎日志区分复用的
                              # 是子 agent 输出 KV 还是 main 历史 KV
+    trace_key: tuple[str, ...] | None = None  # sub invocation 身份; 同一次 sub 多轮推理覆盖保存
 
 
 @dataclass
@@ -240,18 +244,16 @@ class SessionKVStore:
     """按 agent 会话保存请求的完整序列 KV，供跨请求前缀复用.
 
     保留策略:
-    - **main/sub 段都只保留最新一条**(main 请求每轮覆盖): main 下一轮请求的
-      prompt 是上一轮完整序列(模板渲染逐字一致)的延续, 保存段构成嵌套前缀链 ——
-      最新段与任意新 prompt 的 LCP 恒 ≥ 旧段, 引擎对候选取最长 LCP 时旧段
-      永远不可能胜出, 只留最新一条即可; 被截断的请求不保存(尾锚定段无法对齐,
-      见 server._agent_kv_finish);
-    - **sub 段保留最新一条**: 只留最近一次 sub 请求的完整序列(含其输出),
-      即"保存好最新的子 Agent 的输出 KV", 供子 agent 多轮续接与拼接模式使用.
+    - **main 段保留最新一条**: main 请求每轮覆盖, 用于后续 main 的 LCP 基础复用;
+    - **sub 段按 trace_key 保留最新 main 之后的每次 sub invocation**: 同一个
+      sub 内部多轮模型调用覆盖为最新一整段 KV, 不拆成多个候选; 多个 sub
+      invocation 各保留一段。新的 main 保存成功后清空 sub 列表, 因为这些历史
+      已被 main 段覆盖.
     """
 
     def __init__(self, config=None, tokenizer=None, idle_ttl: float = 3600.0) -> None:
-        # session_id -> {"main": KVPrefix | None, "sub": KVPrefix | None}
-        self._segments: dict[str, dict[str, KVPrefix | None]] = {}
+        # session_id -> {"main": KVPrefix | None, "subs": list[KVPrefix]}
+        self._segments: dict[str, dict[str, Any]] = {}
         self._last_seen: dict[str, float] = {}  # session_id -> 最近一次 put 时间(闲置清理用)
         self._idle_ttl = idle_ttl
         self._stats = {"reuse_attempts": 0, "reuse_hits": 0, "reuse_tokens": 0,
@@ -296,15 +298,36 @@ class SessionKVStore:
         
         logger.info(f"释放 {session_id} 的显存")
 
+    def clear_subs(self, session_id: str) -> None:
+        """释放指定会话中最新 main 之后累计的 sub KV 段。
+
+        final main 已经把这些 tool response 纳入自己的 prompt/cache 后, sub 段
+        不再需要单独保留; 清掉引用即可让 PyTorch 回收/复用显存缓存。
+        """
+        segs = self._segments.get(session_id)
+        if not segs:
+            return
+        subs = segs.get("subs")
+        if not isinstance(subs, list) or not subs:
+            return
+        count = len(subs)
+        tokens = sum(len(seg.tokens) for seg in subs)
+        segs["subs"] = []
+        logger.info("会话 %s: 释放已被 main 消费的 sub KV %d 段/%d tok",
+                    session_id, count, tokens)
+
     def put(self, session_id: str, kind: str, seq_tokens: list[int],
             cache: DynamicCache, prompt_len: int = 0,
-            think_len: int = 0) -> bool:
+            think_len: int = 0,
+            trace: list[str] | None = None) -> bool:
         """保存一次请求的完整序列 KV; 返回是否保存成功.
 
         seq_tokens 必须与 cache 长度一致(prompt + 输出, 位置从 0 开始),
         否则说明缓存与序列未对齐(理论上不会发生, 防御性检查), 丢弃并告警.
 
-        保留策略: main 段与 sub 段都替换为最新一条(每轮覆盖).
+        保留策略: main 段替换为最新一条; sub 段按 trace_key 代表的一次
+        sub agent invocation 覆盖保存。也就是说同一个 sub 内部多次模型调用
+        只保留最终/最新一整段 KV, 不拆成多个候选段。
         每次 put 顺带按 idle_ttl 清扫闲置会话段.
 
         prompt_len / think_len: 拼接模式用 —— 记录输出 KV 的起始位置与
@@ -320,141 +343,187 @@ class SessionKVStore:
         now = time.time()
         self._prune_idle(now)
         self._last_seen[session_id] = now
-        segs = self._segments.setdefault(session_id, {"main": None, "sub": None})
+        segs = self._segments.setdefault(session_id, {"main": None, "subs": []})
+        trace_key = tuple(trace) if trace else None
         prefix = KVPrefix(seq_tokens, cache, output_start=prompt_len,
-                          think_len=think_len, kind=kind)
+                          think_len=think_len, kind=kind, trace_key=trace_key)
         if kind == KIND_MAIN:
-            segs["main"] = prefix  # main 段保留最新一条(嵌套前缀链下最新段恒为最长候选)
+            segs["main"] = prefix
+            self.clear_subs(session_id)
         else:
-            segs["sub"] = prefix   # sub 段只留最新一条
+            subs = segs.setdefault("subs", [])
+            assert isinstance(subs, list)
+            replaced = False
+            if trace_key is not None:
+                for i, seg in enumerate(subs):
+                    if isinstance(seg, KVPrefix) and seg.trace_key == trace_key:
+                        subs[i] = prefix
+                        replaced = True
+                        logger.info("会话 %s: 更新同一 sub 调用 trace %s 的 KV 段 "
+                                    "%d -> %d tok", session_id, list(trace_key),
+                                    len(seg.tokens), len(seq_tokens))
+                        break
+            if not replaced:
+                subs.append(prefix)
         logger.info("会话 %s: 保存 %s 段 KV %d tok(输出 %d tok, think %d tok) "
                     "供跨请求复用", session_id, kind, len(seq_tokens),
                     len(seq_tokens) - prompt_len, think_len)
         return True
 
-    def build_graft(self, session_id: str, trace: list[str],
-                    prompt_tokens: list[int]) -> KVGraft | None:
-        """位置感知拼接(实验): 定位子 agent 输出正文在 prompt 中的位置, 供引擎插入其 KV.
+    def _match_graft_window(
+        self,
+        session_id: str,
+        sub_seg: KVPrefix,
+        window: list[int],
+        body_start: int,
+    ) -> KVGraft | None:
+        """把一个 tool_response 窗口与一个 sub 输出对齐。
 
-        chat template 渲染 tool 消息时, 客户端回填的子输出正文前后带包裹标记
-        (如 Qwen3 的 <tool_response>), 这层标记是 main prompt 相对子请求多出来
-        的几个 token —— 由引擎照常 prefill([base_len, p) 与 [p+L, n) 两段),
-        正文部分则插入子请求时算好的 KV。本函数负责找出正文起点 p 与对应的
-        子输出 KV 切片, 定位分两步:
-
-        1. 锚定窗口: 包裹标记是特殊 token(id 与上下文无关), 取 prompt 中
-           **最后一个闭标记**(其后只有模板尾部与生成前缀)与它之前**最后一个
-           开标记**(即最后一条 tool 消息的包裹标记), 两者之间的 token 窗口 =
-           换行/边界 token + 正文 + 换行/边界 token;
-        2. 窗口与子输出对齐: 正文按子 agent 自己的上下文分词(保存段), 回填进
-           main 的 prompt 后重分词, 首尾边界可能与相邻换行/标记合并(如结尾 '。'
-           与模板追加的 '\n' 合成一个 token '。\n')。更重要的是**正文在子输出
-           序列中的位置不确定**: thinking 开启时模型常把正文整个写进 <think>
-           块(块后只剩 eos), 关闭时写在块后 —— 因此不能按 think_len 一刀切,
-           而是把窗口与**子输出完整序列**做 token 级最长连续段匹配: 主侧窗口
-           头允许 ≤ GRAFT_HEAD_SLACK 漂移(边界合并/客户端剥离空白), 子侧用
-           token->位置 索引枚举所有候选起点(正文可能出现在 think 块内外任意
-           位置)。只拼接逐位一致的部分, 首尾不一致的边界 token 照常 prefill。
-
-        守卫: 窗口为空、明显长于子输出序列(一条 tool 消息含多个结果/客户端
-        回填增补内容)或匹配太短(不足 GRAFT_MIN_MATCH token, 可能误命中)时返回
-        None, 引擎安全回退 LCP 模式, 绝不错误拼接(引擎还会对位置/长度/token
-        逐位校验, 见 engine._generate)。
-
-        复杂度 O(prompt + 子输出 + 窗口对齐), 而非旧版对整段 [min_pos, n) 的
-        O(n·m) 扫描; 窗口与子输出都由普通文本组成时对齐接近线性, 极端重复
-        文本下退化为 O(窗口·子输出), 但仍远小于旧版且结果正确。
-
-        返回 KVGraft(position/tokens/cache), 无 sub 段或定位失败时返回 None.
+        一个 sub agent 的最终输出 KV 作为一个整体候选处理: 每个窗口最多
+        产出一个连续 graft 片段。边界上不能匹配的 token 由引擎正常 prefill;
+        不把同一个 sub 输出拆成多个 KV 片段。
         """
-        if len(trace) < 2 or trace[-1] != KIND_MAIN or trace[-2] == KIND_MAIN:
-            return None
-        open_id, close_id = self._resp_marker_ids
-        if open_id is None or close_id is None:
-            return None  # tokenizer 无包裹标记, 拼接模式不可用(见 __init__)
-        segs = self._segments.get(session_id)
-        if not segs:
-            return None
-        sub_seg = segs.get(KIND_SUB)
-        if sub_seg is None:
-            return None
-        self._stats["reuse_attempts"] += 1
-
-        # 子输出完整序列(think 块 + 正文 + eos): 正文可能写在 think 块内或块后,
-        # 不能按 think_len 预先剔除 —— 见第 2 步的对齐
         sub_out = sub_seg.tokens[sub_seg.output_start:]
         if not sub_out:
             logger.info("会话 %s: 子 agent 段没有输出, 无法拼接", session_id)
             return None
-
-        # ---- 1. 锚定窗口: 最后一条 tool 消息的包裹标记 ----
-        n = len(prompt_tokens)
-        close_pos = -1  # 最后一个闭标记: 其后只有模板尾部与生成前缀
-        for i in range(n - 1, -1, -1):
-            if prompt_tokens[i] == close_id:
-                close_pos = i
-                break
-        open_pos = -1   # 闭标记之前最后一个开标记: 最后一条 tool 消息的开标记
-        for i in range(close_pos - 1, -1, -1):
-            if prompt_tokens[i] == open_id:
-                open_pos = i
-                break
-        if close_pos < 0 or open_pos < 0:
-            logger.info("会话 %s: prompt 中未找到 %s/%s 包裹标记, "
-                        "放弃拼接(回退 LCP)", session_id,
-                        TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE)
+        if not window:
+            logger.info("会话 %s: tool response 窗口为空, 放弃该窗口拼接", session_id)
             return None
 
-        window = prompt_tokens[open_pos + 1:close_pos]
-        # 窗口 = 换行/边界 token + 正文 + 换行/边界 token; 明显长于子输出序列
-        # 说明窗口里混入了其他内容(一条 tool 消息含多个结果等), 锚点不可靠
-        if not window or len(window) > len(sub_out) + GRAFT_WINDOW_SLACK:
-            logger.info("会话 %s: 包裹标记间窗口 %d tok 与子输出 %d tok 不符, "
-                        "放弃拼接(回退 LCP)", session_id, len(window), len(sub_out))
-            return None
-
-        # ---- 2. 窗口与子输出对齐 ----
-        # i: 窗口头跳过的 token 数(标记残留/边界合并/客户端剥离, ≤ SLACK);
-        # j: 正文在子输出序列中的起点(think 块内外任意位置, 枚举全部出现)。
-        # 尾部边界不一致由匹配自然截断, 无需特殊处理。
+        # 在 window/sub_out 中找一个最长公共连续片段。未匹配 token 通常是
+        # tool_response 包裹、换行、边界 BPE 合并、thinking 剥离或 eos 差异,
+        # 留给 main 上下文正常 prefill。
         index: dict[int, list[int]] = {}
-        for idx, tok in enumerate(sub_out):
-            index.setdefault(tok, []).append(idx)
+        for j, tok in enumerate(sub_out):
+            index.setdefault(tok, []).append(j)
         best_k, best_i, best_j = 0, -1, -1
-        for i in range(min(GRAFT_HEAD_SLACK + 1, len(window))):
-            for j in index.get(window[i], ()):
-                if len(sub_out) - j <= best_k:
-                    continue  # 余量超不过当前最优, 剪枝
+        for i, tok in enumerate(window):
+            for j in index.get(tok, ()):
+                if len(window) - i <= best_k or len(sub_out) - j <= best_k:
+                    continue
                 k = 1
                 while (i + k < len(window) and j + k < len(sub_out)
                        and window[i + k] == sub_out[j + k]):
                     k += 1
                 if k > best_k:
                     best_k, best_i, best_j = k, i, j
-        # 匹配太短不可靠(可能误命中), 保守放弃拼接
         if best_k < GRAFT_MIN_MATCH:
-            logger.info("会话 %s: 未在窗口中定位到子 agent 输出正文, "
-                        "放弃拼接(回退 LCP)", session_id)
+            logger.info("会话 %s: 未在窗口中定位到子 agent 输出正文, 放弃该窗口拼接",
+                        session_id)
             return None
 
-        pos = open_pos + 1 + best_i
+        pos = body_start + best_i
         tokens = sub_out[best_j:best_j + best_k]
         cache = slice_cache(
             tail_cache(sub_seg.cache, sub_seg.output_start + best_j, self._config),
             best_k, self._config)
-        logger.info("会话 %s: 定位子 agent 输出 KV %d tok(输出起点 +%d, "
-                    "think_len %d, prompt 位置 %d..%d, 头部漂移 %d tok), 准备插入",
-                    session_id, best_k, best_j, sub_seg.think_len,
-                    pos, pos + best_k - 1, best_i)
+        logger.info("会话 %s: 定位子 agent 输出 KV 1 段/%d tok(窗口 %d tok, "
+                    "输出 %d tok, think_len %d), 准备插入",
+                    session_id, best_k, len(window), len(sub_out), sub_seg.think_len)
         return KVGraft(position=pos, tokens=tokens, cache=cache,
                        source_position=sub_seg.output_start + best_j)
+
+    def build_grafts(self, session_id: str, trace: list[str],
+                     prompt_tokens: list[int]) -> list[KVGraft]:
+        """位置感知拼接(实验): 定位多个子 agent 输出正文, 供引擎插入其 KV.
+
+        chat template 渲染 tool 消息时, 客户端回填的子输出正文前后带包裹标记
+        (如 Qwen3 的 <tool_response>), 这层标记是 main prompt 相对子请求多出来
+        的几个 token。窗口内不能与 sub 最终输出逐位匹配的边界 token 由引擎
+        正常 prefill; 匹配到的最长连续正文片段则插入子请求时算好的 KV。每个
+        tool response 会向后寻找能匹配的 sub 输出; 同一次 sub invocation 的中间
+        KV 在保存时已被最新段覆盖。一个 sub 输出最多生成一个 graft 片段。
+
+        返回按 prompt 位置升序排列的 KVGraft 列表; 无 sub 段或定位失败时返回空列表.
+        """
+        if len(trace) < 2 or trace[-1] != KIND_MAIN or trace[-2] == KIND_MAIN:
+            return []
+        open_id, close_id = self._resp_marker_ids
+        if open_id is None or close_id is None:
+            return []  # tokenizer 无包裹标记, 拼接模式不可用(见 __init__)
+        segs = self._segments.get(session_id)
+        if not segs:
+            return []
+        subs = segs.get("subs")
+        if not isinstance(subs, list) or not subs:
+            return []
+        self._stats["reuse_attempts"] += 1
+
+        # 从最新 main 与当前 prompt 的 LCP 之后扫描。不能直接用 len(main_seg.tokens):
+        # 第一次 main 原始生成的 tool-call 文本与 final prompt 中结构化 tool_calls
+        # 的模板渲染可能不等长, 直接按长度跳会越过前面的 tool_response。
+        main_seg = segs.get(KIND_MAIN)
+        search_start = (longest_common_prefix(prompt_tokens, main_seg.tokens)
+                        if isinstance(main_seg, KVPrefix) else 0)
+        windows: list[tuple[int, int, list[int]]] = []
+        n = len(prompt_tokens)
+        i = search_start
+        while i < n:
+            if prompt_tokens[i] != open_id:
+                i += 1
+                continue
+            close_pos = -1
+            for j in range(i + 1, n):
+                if prompt_tokens[j] == close_id:
+                    close_pos = j
+                    break
+            if close_pos < 0:
+                break
+            windows.append((i + 1, close_pos, prompt_tokens[i + 1:close_pos]))
+            i = close_pos + 1
+        logger.info("会话 %s: build_grafts trace %s, prompt %d tok, main_lcp %d tok, "
+                    "tool_response 窗口 %d 个, 候选 sub 段 %d 个",
+                    session_id, trace, n, search_start, len(windows), len(subs))
+        if not windows:
+            logger.info("会话 %s: prompt 中未找到 %s/%s 包裹标记, "
+                        "放弃拼接(回退 LCP)", session_id,
+                        TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE)
+            return []
+
+        grafts: list[KVGraft] = []
+        matched_windows = 0
+        sub_i = 0
+        for win_idx, (body_start, _close_pos, window) in enumerate(windows, start=1):
+            best_match: KVGraft | None = None
+            best_i = -1
+            best_tokens = 0
+            for match_i in range(sub_i, len(subs)):
+                candidate = self._match_graft_window(
+                    session_id, subs[match_i], window, body_start)
+                candidate_tokens = len(candidate.tokens) if candidate is not None else 0
+                if candidate_tokens > best_tokens:
+                    best_match = candidate
+                    best_i = match_i
+                    best_tokens = candidate_tokens
+            if best_match is not None:
+                sub_i = best_i + 1
+                matched_windows += 1
+                grafts.append(best_match)
+                logger.info("会话 %s: 第 %d/%d 个 tool response 选择第 %d/%d 个 sub "
+                            "候选, 匹配 %d tok", session_id, win_idx, len(windows),
+                            best_i + 1, len(subs), best_tokens)
+            else:
+                logger.info("会话 %s: 第 %d/%d 个 tool response 未匹配到后续 sub "
+                            "最终正文 KV, 跳过该窗口", session_id, win_idx, len(windows))
+        if grafts:
+            logger.info("会话 %s: 共定位 %d/%d 个 tool response, 生成 %d 个 KV 片段"
+                        "(候选 sub 段 %d 个), 准备多段拼接",
+                        session_id, matched_windows, len(windows), len(grafts), len(subs))
+        return grafts
+
+    def build_graft(self, session_id: str, trace: list[str],
+                    prompt_tokens: list[int]) -> KVGraft | None:
+        """兼容旧调用: 返回最后一段可拼接的子 agent 输出 KV."""
+        grafts = self.build_grafts(session_id, trace, prompt_tokens)
+        return grafts[-1] if grafts else None
 
     def propose(self, session_id: str, trace: list[str]) -> list[KVPrefix]:
         """给出可尝试复用的候选段(空列表 = 本次不尝试).
 
         触发条件已放宽(不再限定"main 在子 agent 返回后继续"): 只要会话里有
-        已保存的段就给出候选 —— main 请求给最新 main 段 + 最新 sub 段,
-        sub 请求给最新 sub 段(同一 sub 的多轮续接)。具体能否复用、复用多少
+        已保存的段就给出候选 —— main 请求给最新 main 段 + 最新 main 后的 sub 段,
+        sub 请求给最近 sub 段(同一 sub 的多轮续接)。具体能否复用、复用多少
         由引擎的 LCP 匹配决定(前缀不一致自动回退全量 prefill, 零风险).
         """
         segs = self._segments.get(session_id)
@@ -463,13 +532,15 @@ class SessionKVStore:
         self._stats["reuse_attempts"] += 1
         if trace and trace[-1] == KIND_MAIN:
             candidates: list[KVPrefix] = []
-            if segs["main"] is not None:
+            if isinstance(segs.get("main"), KVPrefix):
                 candidates.append(segs["main"])  # 最新 main 段(含其输出 KV)
-            if segs["sub"] is not None:
-                candidates.append(segs["sub"])   # 最新 sub 段(含其输出 KV)
+            subs = segs.get("subs")
+            if isinstance(subs, list):
+                candidates.extend(subs)          # 最新 main 后的所有 sub 段
             return candidates
-        if segs["sub"] is not None:
-            return [segs["sub"]]  # sub 请求: 该 sub 最近一轮的段(续接时可复用)
+        subs = segs.get("subs")
+        if isinstance(subs, list) and subs:
+            return [subs[-1]]  # sub 请求: 最近 sub 段(续接时可复用)
         return []
 
     def note_hit(self, reused_tokens: int) -> None:

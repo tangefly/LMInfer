@@ -156,7 +156,8 @@ def _parse_call_block(block: str) -> Dict[str, Any] | None:
 
 
 def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """扫描整段生成文本, 返回 OpenAI 格式的 tool_calls 列表(解析失败的块跳过)."""
+    """扫描可见输出, 返回 OpenAI 格式的 tool_calls 列表(解析失败的块跳过)."""
+    text = THINK_BLOCK.sub("", text)
     calls: List[Dict[str, Any]] = []
     for block in TOOL_CALL_BLOCK.findall(text):
         call = _parse_call_block(block)
@@ -166,12 +167,9 @@ def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
 
 
 def clean_content(text: str) -> str:
-    """去掉 <tool_call> 块(已解析为 tool_calls), 其余内容原样返回.
-
-    <think>...</think> 思考块(含标签)保留在 content 中, 供需要观测思考过程的
-    客户端直接使用; 需要剥离的客户端(如 ToyAgent 的 _strip_think)按标签自行处理.
-    """
+    """去掉 <tool_call> 与 <think> 块, 只返回可进入对话历史的内容."""
     text = TOOL_CALL_BLOCK.sub("", text)
+    text = THINK_BLOCK.sub("", text)
     return text.strip()
 
 
@@ -322,12 +320,13 @@ def _llama_call_from_obj(obj: Dict[str, Any], block: str) -> Dict[str, Any] | No
 
 
 def parse_llama3_json_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """扫描整段生成文本, 提取 Llama 3.x JSON 工具调用.
+    """扫描可见输出, 提取 Llama 3.x JSON 工具调用.
 
     与 vLLM 的 llama3_json 解析一致: 用 JSONDecoder.raw_decode 从每个 { 处解析
     完整 JSON 对象(正确处理任意嵌套深度与字符串内的括号), 跳过已解析对象内部的
     {, 支持多个对象以 ; 分隔及周围任意文本. 解析失败/缺 name 键的对象跳过.
     """
+    text = THINK_BLOCK.sub("", text)
     calls: List[Dict[str, Any]] = []
     decoder = json.JSONDecoder()
     end = -1  # 已解析对象覆盖到的下标: 跳过其内部的 {, 避免把嵌套对象当新调用
@@ -347,14 +346,10 @@ def parse_llama3_json_tool_calls(text: str) -> List[Dict[str, Any]]:
 
 
 def clean_llama3_json_content(text: str) -> str:
-    """去掉开头的 <|python_tag|> 标记, 其余内容原样返回.
-
-    JSON 工具调用对象已被解析为 tool_calls(与 vLLM 一致, 有 tool_calls 时
-    content 为 null), 无需在这里剔除; 这里只清理模型在普通文本回复时
-    误带的 <|python_tag|> 前缀(特殊 token, skip_special_tokens=False 解码
-    后原样出现).
-    """
-    return text.removeprefix(LLAMA_PYTHON_TAG).strip()
+    """去掉工具调用前缀与 <think> 块, 只返回可进入对话历史的内容."""
+    text = text.removeprefix(LLAMA_PYTHON_TAG)
+    text = THINK_BLOCK.sub("", text)
+    return text.strip()
 
 
 class LlamaJsonStreamSplitter:

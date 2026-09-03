@@ -235,12 +235,12 @@ prompt 重新 prefill——历史 token 的 KV 明明在子 agent 请求里已�
 
 ### 工作原理
 
-1. **保存**：每个 agent 会话按请求来源（`main` / `sub`）保存最近一次请求的
-   完整序列（prompt + 生成输出）及其 KV cache，位置从 0 开始、与 token 序列
-   逐位对齐（`lminfer/kvcache.py` 的 `SessionKVStore`）；
-2. **触发**：当请求的 trace 末位是 `main` 且前一个是子 agent（如
-   `["main", "sub1", "main"]`），即主 agent 在子 agent 返回后继续生成时，
-   尝试复用已保存的前缀 KV（优先子 agent 的输出 KV）；
+1. **保存**：每个 agent 会话保存最新 `main` 完整序列；`sub` 则保留最新
+   `main` 之后的全部请求（prompt + 生成输出）及其 KV cache，位置从 0 开始、
+   与 token 序列逐位对齐（`lminfer/kvcache.py` 的 `SessionKVStore`）；
+2. **触发**：同一会话后续请求都会尝试复用候选 KV。`main` 请求会拿到最新
+   `main` 段和最新 `main` 之后的所有 `sub` 段；`sub` 请求拿到最近 `sub` 段
+   用于多轮续接；
 3. **正确性守卫**：引擎对新 prompt 与保存的序列做 **token 级最长公共前缀
    （LCP）匹配**，只复用真正相同的部分，其余继续 prefill。KV 是 (token, 位置)
    的确定性函数——token 与位置都一致，注意力结果在数学上就与全量 prefill
@@ -277,8 +277,8 @@ python experiments/agent_kv_reuse.py --model /path/to/model
 - **数值等价性**：复用与全量 prefill 数学上等价，但 bf16 精度下存在
   内核级舍入差异（与切换 attention 实现同级，~1e-2 相对误差），贪心输出
   通常逐 token 一致，个别低置信位置可能翻转，属正常现象；
-- 显存代价：每个会话保留最近一次 `main` / `sub` 请求的完整 KV cache，
-  长会话会占额外显存，旧段随新请求替换而释放。
+- 显存代价：每个会话保留最近一次 `main` 请求，以及最新 `main` 之后所有
+  `sub` 请求的完整 KV cache；下一次 `main` 保存成功后会清空这批 `sub` 段。
 
 ### 位置感知拼接模式（`--reuse-agent-kv-append`，实验）
 
@@ -292,14 +292,14 @@ LCP 安全模式只能复用"前缀完全一致"的 KV。子 agent 的输出作�
 lminfer serve /path/to/model --reuse-agent-kv-append
 ```
 
-机制：main 在子 agent 返回后继续请求时，服务端（`SessionKVStore.build_graft`）
-在渲染后的 prompt token 序列中**定位子 agent 输出正文的位置**，把子 agent
-请求时算好的输出 KV **直接插进 main 的 KV cache 对应位置**（引擎的
-`KVGraft` 流程）：
+机制：main 在一个或多个子 agent 返回后继续请求时，服务端
+（`SessionKVStore.build_grafts`）在渲染后的 prompt token 序列中**定位每个
+子 agent 输出正文的位置**，把子 agent 请求时算好的输出 KV 按 prompt 顺序
+**直接插进 main 的 KV cache 对应位置**（引擎的 `KVGraft` 流程）：
 
 ```text
-新 prompt = [main 历史(KV 已存)] [role 标记] [子输出正文] [role 标记] [新内容]
-                  LCP 复用              prefill       ↑ 插入子输出 KV      prefill
+新 prompt = [main 历史] [标记] [sub1 正文] [标记] [sub2 正文] [标记] [新内容]
+              LCP 复用  prefill   ↑ graft    prefill   ↑ graft    prefill
 ```
 
 - **锚点**：子输出是"本轮新内容"，搜索起点取最新 main 段长度，历史里与
@@ -322,9 +322,9 @@ lminfer serve /path/to/model --reuse-agent-kv-append
 
 ```bash
 # 服务日志会显示定位、拼接与复用
-#   会话 xxx: 定位子 agent 输出正文 KV 52 tok(prompt 位置 582..633, 剔除 think 0 tok / 边界漂移 1 tok), 准备插入
-#   请求 xxx: 拼接子 agent 输出 KV 52 tok(位置 582..633) + 复用 main 历史 KV 575 tok, 剩余 18 tok prefill
-#   请求 xxx: prompt 645 tok, 生成 60 tok, ..., 复用前缀 627 tok
+#   会话 xxx: 共定位 3/3 段子 agent 输出 KV, 准备多段拼接
+#   请求 xxx: 拼接子 agent 输出 KV 3 段/156 tok(位置 582..811) + 复用 main 历史 KV 575 tok, 剩余 18 tok prefill
+#   请求 xxx: prompt 749 tok, 生成 60 tok, ..., 复用前缀 731 tok
 #   请求 xxx: 会话 xxx trace ['main', 'researcher', 'main'] KV 前缀复用 627 tok(prompt 645 tok, 跳过 97% prefill; 来源见引擎日志)
 ```
 

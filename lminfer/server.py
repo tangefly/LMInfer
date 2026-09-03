@@ -62,7 +62,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
     if engine.config.tool_call_parser == "auto":
         logger.info("tool-call-parser=auto 自动识别为: %s", profile.tool_parser)
     # 跨请求前缀 KV 复用存储(仅 --reuse-agent-kv / --reuse-agent-kv-append 时使用, 见 kvcache.py)
-    # tokenizer 供拼接模式取 <tool_response> 包裹标记的 token id(见 SessionKVStore.build_graft)
+    # tokenizer 供拼接模式取 <tool_response> 包裹标记的 token id(见 SessionKVStore.build_grafts)
     kv_store = SessionKVStore(config=engine.model.config,
                               tokenizer=engine.tokenizer,
                               idle_ttl=engine.config.kv_segment_idle_ttl)
@@ -156,7 +156,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
             yield _sse({**base, "object": "text_completion",
                         "choices": [{"index": 0, "text": payload, "finish_reason": None}]})
 
-    def _message_dicts(messages: list[ChatMessage]) -> list[dict]:
+    def _message_dicts(messages: list[ChatMessage], strip_assistant_think: bool = True) -> list[dict]:
         """pydantic 消息转纯 dict, 交给 chat template 渲染.
 
         模板里既可能写 message['role'] 也可能写 message.role(jinja 的 `.` 对 dict
@@ -176,7 +176,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
             # 历史 assistant 消息里的 think 块在渲染前剔除: 返回文本保留 think(见
             # clean_content), 但思考内容重新进入 prompt 会让 Qwen3 后续生成退化
             # (不闭合 think 就调工具/空思考+答非所问), 渲染期剥掉与 vLLM 行为一致
-            if m.role == "assistant" and isinstance(content, str):
+            if strip_assistant_think and m.role == "assistant" and isinstance(content, str):
                 content = THINK_BLOCK.sub("", content)
             d = {"role": m.role, "content": content}
             if m.tool_calls is not None:
@@ -261,16 +261,19 @@ def create_app(engine: LLMEngine) -> FastAPI:
             kv_store.note_graft_mismatch()
         # 被截断的请求不保存: 保存段尾锚定(从截断点起), 与下一轮完整历史的头部
         # 必然错位, 永远无法作为前缀复用 —— 单槽位 store 下还会覆盖之前的好段
+        kind = KIND_MAIN if trace[-1] == KIND_MAIN else KIND_SUB
         if prompt_ids.shape[1] > r.prompt_tokens:
             logger.info("请求 %s: prompt 被截断(%d -> %d tok), 跳过 KV 保存",
                         r.request_id, prompt_ids.shape[1], r.prompt_tokens)
+            if kind == KIND_MAIN and attempted:
+                kv_store.clear_subs(session_id)
             return
         seq_tokens = prompt_ids[0][-r.prompt_tokens:].tolist() + r.output_tokens
-        kind = KIND_MAIN if trace[-1] == KIND_MAIN else KIND_SUB
         # prompt_len/think_len 用于拼接模式: 记录输出 KV 起始位置与开头
         # <think> 块的 token 数, 拼接时切出/剔除对应 KV
         kv_store.put(session_id, kind, seq_tokens, r.kv_cache,
-                     prompt_len=r.prompt_tokens, think_len=r.output_think_tokens)
+                     prompt_len=r.prompt_tokens, think_len=r.output_think_tokens,
+                     trace=trace)
 
     # ------------------------------------------------------------------
     # 路由
@@ -380,10 +383,14 @@ def create_app(engine: LLMEngine) -> FastAPI:
         elif engine.config.enable_thinking is not None:
             kwargs["enable_thinking"] = engine.config.enable_thinking
         try:
-            ids = engine.tokenizer.apply_chat_template(_message_dicts(req.messages), **kwargs)
+            # 历史 assistant think 不能重新进入 prompt。Qwen3 会把计划和工具调用
+            # 决策写进 think 块, 回填后容易在多轮 tool use 中重复触发同一工具。
+            # KV 复用必须服从这个语义约束: LCP 少复用一段 think 输出是可接受的。
+            msg_dicts = _message_dicts(req.messages, strip_assistant_think=True)
+            ids = engine.tokenizer.apply_chat_template(msg_dicts, **kwargs)
             new_kwargs = kwargs.copy()
             new_kwargs["tokenize"] = False
-            text_prompt = engine.tokenizer.apply_chat_template(_message_dicts(req.messages), **new_kwargs)
+            text_prompt = engine.tokenizer.apply_chat_template(msg_dicts, **new_kwargs)
         except Exception as e:  # 模板缺参数、模板不支持 tools 等
             raise HTTPException(400, f"chat template 渲染失败: {e}")
         if hasattr(ids, "input_ids"):  # transformers 5.x 返回 tokenizers.Encoding
@@ -398,7 +405,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
         reuse_prefixes, graft = None, None
         if session_id is not None and engine.config.reuse_agent_kv_append:
             prompt_tokens = prompt_ids[0].tolist()
-            graft = kv_store.build_graft(session_id, req.trace, prompt_tokens)
+            graft = kv_store.build_grafts(session_id, req.trace, prompt_tokens)
             reuse_prefixes = kv_store.propose(session_id, req.trace)
         elif session_id is not None and engine.config.reuse_agent_kv:
             reuse_prefixes = kv_store.propose(session_id, req.trace)
