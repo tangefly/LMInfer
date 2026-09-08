@@ -82,6 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
         p_serve.add_argument(f"--repair-window-{edge}", type=repair_ratio, default=0.0,
                             help=f"每段复用 KV 的 {edge} 重算比例 [0, 1], "
                                  "token 数向下取整; 0 关闭, 0.15 表示 15%%")
+    p_serve.add_argument("--repair-mode", choices=["window", "context", "exact"], default="window")
+    p_serve.add_argument("--repair-shallow-layers", type=int, default=1)
+    p_serve.add_argument("--repair-budget", type=repair_ratio, default=0.3)
+    p_serve.add_argument("--repair-coverage", type=repair_ratio, default=0.95)
+    p_serve.add_argument("--repair-min-ratio", type=repair_ratio, default=0.05)
+    p_serve.add_argument("--repair-probe-tokens", type=int, default=8)
+    p_serve.add_argument("--repair-probe-threshold", type=float, default=0.0)
     p_serve.add_argument("--kv-segment-idle-ttl", type=float, default=None,
                          help="已保存 KV 段的会话闲置超时秒数(默认 3600): 会话闲置超过该时长, "
                               "其全部 KV 段被清理释放显存. 0 表示不清理")
@@ -136,6 +143,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
         graft_rope_rebase=args.graft_rope_rebase,
         repair_window_begin=args.repair_window_begin,
         repair_window_end=args.repair_window_end,
+        repair_mode=args.repair_mode,
+        repair_shallow_layers=args.repair_shallow_layers,
+        repair_budget=args.repair_budget,
+        repair_coverage=args.repair_coverage,
+        repair_min_ratio=args.repair_min_ratio,
+        repair_probe_tokens=args.repair_probe_tokens,
+        repair_probe_threshold=args.repair_probe_threshold,
         kv_segment_idle_ttl=args.kv_segment_idle_ttl if args.kv_segment_idle_ttl is not None else 3600.0,
     )
     logger.info("启动服务: %s:%d (模型 %s)", args.host, args.port, args.model)

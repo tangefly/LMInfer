@@ -21,7 +21,7 @@ agent 模式下, 主 agent 调起子 agent, 子 agent 的输出会作为新消�
 3. 引擎对候选段与新 prompt 做 **token 级最长公共前缀(LCP)匹配**, 只复用
    真正相同的部分, 其余继续 prefill —— 这是正确性的根本保证:
 
-   KV 是 (token, 位置) 的确定性函数。只要复用的 token 与位置和全量 prefill
+   KV 依赖完整因果前缀、位置、mask 和模型。只要精确前缀与全量 prefill
    逐位一致, 注意力结果在数学上就完全相同(数值上存在 bf16 内核级舍入差异,
    与切换 attention 实现同级)。反之, 任何渲染不一致(如 Qwen3 模板对末尾
    assistant 消息插入 <think> 块)都会让 LCP 提前停止, 安全回退到全量 prefill,
@@ -95,6 +95,12 @@ class KVPrefix:
     kind: str = ""           # 段来源(KIND_MAIN / KIND_SUB), 供引擎日志区分复用的
                              # 是子 agent 输出 KV 还是 main 历史 KV
     trace_key: tuple[str, ...] | None = None  # sub invocation 身份; 同一次 sub 多轮推理覆盖保存
+
+    exact_prefix_len: int | None = None  # None 表示完整精确; 近似后缀不可通过 LCP 洗白
+
+    @property
+    def exact_length(self) -> int:
+        return len(self.tokens) if self.exact_prefix_len is None else self.exact_prefix_len
 
 
 @dataclass
@@ -319,7 +325,8 @@ class SessionKVStore:
     def put(self, session_id: str, kind: str, seq_tokens: list[int],
             cache: DynamicCache, prompt_len: int = 0,
             think_len: int = 0,
-            trace: list[str] | None = None) -> bool:
+            trace: list[str] | None = None,
+            exact_prefix_len: int | None = None) -> bool:
         """保存一次请求的完整序列 KV; 返回是否保存成功.
 
         seq_tokens 必须与 cache 长度一致(prompt + 输出, 位置从 0 开始),
@@ -340,13 +347,16 @@ class SessionKVStore:
                 session_id, cache.get_seq_length(), len(seq_tokens),
             )
             return False
+        if exact_prefix_len is not None and not 0 <= exact_prefix_len <= len(seq_tokens):
+            raise ValueError("exact_prefix_len outside sequence")
         now = time.time()
         self._prune_idle(now)
         self._last_seen[session_id] = now
         segs = self._segments.setdefault(session_id, {"main": None, "subs": []})
         trace_key = tuple(trace) if trace else None
         prefix = KVPrefix(seq_tokens, cache, output_start=prompt_len,
-                          think_len=think_len, kind=kind, trace_key=trace_key)
+                          think_len=think_len, kind=kind, trace_key=trace_key,
+                          exact_prefix_len=exact_prefix_len)
         if kind == KIND_MAIN:
             segs["main"] = prefix
             self.clear_subs(session_id)

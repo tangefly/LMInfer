@@ -20,7 +20,7 @@ import logging
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import torch
@@ -37,6 +37,7 @@ from transformers import (
 
 from .config import EngineConfig, SamplingParams
 from .repair import repair_token_counts
+from .context_repair import context_prefill, exact_prefill
 from .kvcache import (
     KIND_MAIN,
     KIND_SUB,
@@ -71,6 +72,9 @@ class GenerationResult:
     output_think_tokens: int = 0    # 输出开头 <think> 块的 token 数(拼接模式剔除用:
                                     # think 不作为下一轮对话的 prompt, 拼接 KV 时挖掉)
     kv_graft_mismatch: bool = False  # 位置感知拼接模式: 插入位置/长度/token 校验失败(已回退)
+
+    exact_prefix_len: int | None = None
+    repair_stats: dict = field(default_factory=dict)
 
     @property
     def completion_tokens(self) -> int:
@@ -235,6 +239,11 @@ class LLMEngine:
             prompt_ids = prompt_ids[:, -max_prompt:]
         prompt_ids = prompt_ids.to(self.model.device)
         n_prompt = prompt_ids.shape[1]
+        if prompt_ids.is_cuda:
+            torch.cuda.synchronize(prompt_ids.device)
+        t0 = time.perf_counter()
+        exact_len = n_prompt
+        repair_stats = {}
 
         eos_ids = self._eos_ids()
         generated: list[int] = []                    # 已生成的 token id
@@ -242,7 +251,7 @@ class LLMEngine:
         cache = DynamicCache(config=self.model.config)  # KV cache 容器
 
         # ---- 跨请求前缀 KV 复用 ----
-        # KV 是 (token, 位置) 的确定性函数: 只有 token 与位置都一致的前缀才能复用.
+        # KV 依赖完整因果上下文; LCP 只能复用已知精确的前缀.
         # 整段命中(LCP == n_prompt, 即客户端原样重发同一 prompt)时只需 prefill
         # 最后 1 个 token 就能拿到它的 logits, 同样成立.
         reuse_len = 0
@@ -254,10 +263,10 @@ class LLMEngine:
             best_len, best_cache, best_prefix = 0, None, None
             for prefix in sorted(reuse_prefixes or [],
                                  key=lambda pr: len(pr.tokens), reverse=True):
-                m = min(longest_common_prefix(prompt_list, prefix.tokens), cap)
+                m = min(longest_common_prefix(prompt_list, prefix.tokens), cap, prefix.exact_length)
                 if m > best_len:
                     best_len, best_cache, best_prefix = m, prefix.cache, prefix
-                if best_len == min(len(prefix.tokens), cap):
+                if best_len == cap:
                     break
             return best_len, best_cache, best_prefix
 
@@ -319,7 +328,6 @@ class LLMEngine:
                                 n_prompt, 100.0 * best_len / n_prompt,
                                 n_prompt - best_len)
 
-        t0 = time.perf_counter()
         ttft_ms = 0.0
 
         # 输出开头 <think> 块的 token 数跟踪(状态机):
@@ -358,7 +366,18 @@ class LLMEngine:
             # 标记等插入点前的 token), 把子输出 KV 插进 cache, 再前向 [p+L, n);
             # 若子输出正好到 prompt 末尾, 用最后 1 个 token 的前向拿 logits
             # (与 LCP 整段命中的处理一致), 此时 cache 长度 n-1, 前向后补到 n.
-            if graft_plan is not None:
+            if graft_plan is not None and self.config.repair_mode in ("context", "exact"):
+                base_len, plan_grafts = graft_plan
+                if self.config.repair_mode == "exact":
+                    repaired = exact_prefill(self.model, prompt_ids, cache, base_len)
+                else:
+                    repaired = context_prefill(self.model, prompt_ids, cache, base_len,
+                                               plan_grafts, self.config)
+                out, cache = repaired, repaired.cache
+                exact_len, repair_stats = repaired.exact_prefix_len, repaired.stats
+                reuse_len = base_len
+                logger.info("请求 %s: %s repair %s", request_id, self.config.repair_mode, repair_stats)
+            elif graft_plan is not None:
                 base_len, plan_grafts = graft_plan
                 device = self.model.device
                 total_graft_tokens = sum(len(g.tokens) for g in plan_grafts)
@@ -391,6 +410,7 @@ class LLMEngine:
                         graft_cache = rebase_rope_cache(
                             graft_cache, item.source_position + left_trim,
                             graft_start, self.model.config)
+                    exact_len = min(exact_len, graft_start)
                     # 插入子输出 KV: concat 产生新对象, 后续原地拼接不会污染 store
                     cache = concat_cache(cache, graft_cache, self.model.config)
                     cur = graft_start + graft_len
@@ -428,8 +448,8 @@ class LLMEngine:
                     past_key_values=cache if use_kv_cache else None,
                     use_cache=use_kv_cache,
                 )
-            ttft_ms = (time.perf_counter() - t0) * 1000
             token = self._sample(out.logits[:, -1, :], all_ids, sampling)
+            ttft_ms = (time.perf_counter() - t0) * 1000
             _on_token(token)
             all_ids = torch.cat([all_ids, torch.tensor([[token]], device=self.model.device)], dim=-1)
 
@@ -515,6 +535,8 @@ class LLMEngine:
             kv_cache=cache if use_kv_cache else None,
             output_think_tokens=output_think,
             kv_graft_mismatch=graft_mismatch,
+            exact_prefix_len=(n_prompt + len(generated) if exact_len == n_prompt else exact_len),
+            repair_stats=repair_stats,
         )
 
         # 全局统计 + 每请求日志(风格类似 vLLM 的日志行)

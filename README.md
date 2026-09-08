@@ -1,7 +1,8 @@
 # LMInfer
 
 一个刻意保持**朴素**（naive）的 LLM 推理服务，用于学习与验证 **KV Cache** 相关理论。
-只依赖 transformers 的高层 API（模型加载、`DynamicCache`、采样 warper、chat template），
+常规生成使用 transformers 的高层 API（模型加载、`DynamicCache`、采样 warper、chat template），
+实验性上下文 KV 修复增加了 Qwen3 按层执行路径，
 提供 **vLLM 风格的启动命令** 与 **OpenAI 兼容的 HTTP 接口**。
 
 > vLLM 太复杂？先跑通这个精简版本，把 prefill / decode / KV cache / 并发这几件事
@@ -339,6 +340,17 @@ KV 首尾的重计算比例。例如匹配到 100 token 时，首部重算 15 �
 与 `--reuse-agent-kv`（LCP 模式）的关系：拼接模式是 LCP 模式的超集 ——
 main 历史仍按 LCP 精确复用，定位失败时自动回退到 LCP 行为，因此单独开
 `--reuse-agent-kv-append` 即可同时获得两者收益。
+
+### 上下文误差驱动的分层修复
+
+新增 `--repair-mode context`：完整计算浅层，用目标上下文 KV 差异和注意力读取权重选点，
+深层按原位置稀疏重算，并支持检查阈值触发精确回退。
+`--repair-mode exact` 直接使用精确前缀加完整后缀重算。
+所有模式都会记录缓存精确前缀，防止跨轮 LCP 将近似缓存当成精确结果。
+
+参见 [实现、启动参数和正确性边界](docs/context_repair.md) 与
+[Qwen3-8B 实测结果](artifacts/context_repair.md)。30% 选择性修复在本次测试中更快，
+但仍存在首尾策略答对而新策略答错的案例，不能宣称评分已经优于首尾重算。
 
 ## KV Cache 理论速览（本项目要验证的东西）
 

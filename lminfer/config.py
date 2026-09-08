@@ -40,6 +40,13 @@ class EngineConfig:
                                          # main prompt 位置; 只修正位置差, 不修正上下文差
     repair_window_begin: float = 0.0    # 每段复用 KV 首部重算比例 [0, 1]
     repair_window_end: float = 0.0      # 每段复用 KV 尾部重算比例 [0, 1]
+    repair_mode: str = "window"       # window / context / exact
+    repair_shallow_layers: int = 1    # 完整计算 attention/MLP 的浅层数
+    repair_budget: float = 0.3        # 每段深层修复比例上限(不含 probes)
+    repair_coverage: float = 0.95     # 累计评分覆盖目标, 不是误差保证
+    repair_min_ratio: float = 0.05    # 每段最低修复比例
+    repair_probe_tokens: int = 8      # 未选中位置中的确定性检查点
+    repair_probe_threshold: float = 0.0  # 深层相对 KV 偏差阈值; 0 禁用精确回退
     kv_segment_idle_ttl: float = 3600.0  # 已保存 KV 段的会话闲置超时(秒): 超过后整段清理,
                                          # 防止会话注册表无 TTL 导致 KV 显存随会话永久增长
 
@@ -47,6 +54,21 @@ class EngineConfig:
     def __post_init__(self):
         self.repair_window_begin = repair_ratio(self.repair_window_begin)
         self.repair_window_end = repair_ratio(self.repair_window_end)
+        if self.repair_mode not in ("window", "context", "exact"):
+            raise ValueError("repair_mode must be window, context or exact")
+        for name in ("repair_budget", "repair_coverage", "repair_min_ratio"):
+            setattr(self, name, repair_ratio(getattr(self, name)))
+        if self.repair_min_ratio > self.repair_budget:
+            raise ValueError("repair_min_ratio must not exceed repair_budget")
+        if not isinstance(self.repair_shallow_layers, int) or self.repair_shallow_layers < 1:
+            raise ValueError("repair_shallow_layers must be a positive integer")
+        if self.repair_probe_threshold > 0 and self.repair_probe_tokens == 0:
+            raise ValueError("probe threshold requires probe tokens")
+        import math
+        if (not isinstance(self.repair_probe_tokens, int) or self.repair_probe_tokens < 0
+                or not math.isfinite(self.repair_probe_threshold)
+                or self.repair_probe_threshold < 0):
+            raise ValueError("invalid repair probe settings")
 
 
 @dataclass

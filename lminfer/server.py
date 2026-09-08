@@ -273,7 +273,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
         # <think> 块的 token 数, 拼接时切出/剔除对应 KV
         kv_store.put(session_id, kind, seq_tokens, r.kv_cache,
                      prompt_len=r.prompt_tokens, think_len=r.output_think_tokens,
-                     trace=trace)
+                     trace=trace, exact_prefix_len=r.exact_prefix_len)
 
     # ------------------------------------------------------------------
     # 路由
@@ -469,6 +469,8 @@ def create_app(engine: LLMEngine) -> FastAPI:
             # 实验观测字段: 本次请求跳过 prefill 的 token 数(含拼接的子 agent 输出 KV),
             # 供客户端验证 --reuse-agent-kv / --reuse-agent-kv-append 的效果
             resp["reused_prompt_tokens"] = r.reused_prompt_tokens
+            resp["exact_prefix_len"] = r.exact_prefix_len
+            resp["repair_stats"] = r.repair_stats
         return resp
 
     @app.get("/v1/agent/sessions")
