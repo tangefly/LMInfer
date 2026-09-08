@@ -9,6 +9,7 @@
 import argparse
 import logging
 import sys
+from .repair import repair_ratio
 
 logger = logging.getLogger("lminfer")
 
@@ -77,10 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--graft-rope-rebase", action="store_true",
                          help="拼接子 agent 输出 KV 前修正 RoPE 位置: 将 K 从子上下文位置"
                               "重映射到 main prompt 插入位置. 只修正位置差, 不修正上下文差")
-    p_serve.add_argument("--graft-recompute-window", type=int, default=0,
-                         help="拼接修正窗口 N: 对 [graft_position-N, suffix_start+N) "
-                              "在 main 上下文下重新 prefill, 修正拼接点附近 KV gap. "
-                              "0 表示关闭; 例如 8 表示前后各 8 token")
+    for edge in ("begin", "end"):
+        p_serve.add_argument(f"--repair-window-{edge}", type=repair_ratio, default=0.0,
+                            help=f"每段复用 KV 的 {edge} 重算比例 [0, 1], "
+                                 "token 数向下取整; 0 关闭, 0.15 表示 15%%")
     p_serve.add_argument("--kv-segment-idle-ttl", type=float, default=None,
                          help="已保存 KV 段的会话闲置超时秒数(默认 3600): 会话闲置超过该时长, "
                               "其全部 KV 段被清理释放显存. 0 表示不清理")
@@ -133,7 +134,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         reuse_agent_kv=args.reuse_agent_kv,
         reuse_agent_kv_append=args.reuse_agent_kv_append,
         graft_rope_rebase=args.graft_rope_rebase,
-        graft_recompute_window=max(0, args.graft_recompute_window),
+        repair_window_begin=args.repair_window_begin,
+        repair_window_end=args.repair_window_end,
         kv_segment_idle_ttl=args.kv_segment_idle_ttl if args.kv_segment_idle_ttl is not None else 3600.0,
     )
     logger.info("启动服务: %s:%d (模型 %s)", args.host, args.port, args.model)

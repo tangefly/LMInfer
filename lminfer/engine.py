@@ -36,6 +36,7 @@ from transformers import (
 )
 
 from .config import EngineConfig, SamplingParams
+from .repair import repair_token_counts
 from .kvcache import (
     KIND_MAIN,
     KIND_SUB,
@@ -246,8 +247,7 @@ class LLMEngine:
         # 最后 1 个 token 就能拿到它的 logits, 同样成立.
         reuse_len = 0
         graft_mismatch = False
-        graft_plan: tuple[int, list[KVGraft], int, int] | None = None
-        # (基础复用长度, graft 列表, repair_left, repair_right)
+        graft_plan: tuple[int, list[KVGraft]] | None = None
         prompt_list = prompt_ids[0].tolist()
 
         def _best_prefix(cap: int = n_prompt) -> tuple[int, DynamicCache | None, KVPrefix | None]:
@@ -269,12 +269,8 @@ class LLMEngine:
         if use_kv_cache and grafts:
             print("\n[复用子 Agent 的输出]\n")
             n = n_prompt
-            repair_n = max(0, self.config.graft_recompute_window)
             first_p = grafts[0].position
-            last_end = max(g.position + len(g.tokens) for g in grafts)
-            repair_left = max(0, first_p - repair_n) if repair_n else first_p
-            repair_right = min(n, last_end + repair_n) if repair_n else last_end
-            reuse_cap = repair_left if repair_n else first_p
+            reuse_cap = first_p
             base_len, base_cache, _base_prefix = _best_prefix(reuse_cap)
 
             valid = base_len <= reuse_cap
@@ -296,7 +292,7 @@ class LLMEngine:
                 if reuse_len > 0:
                     cache = slice_cache(best_cache, reuse_len, self.model.config)
             else:
-                graft_plan = (base_len, grafts, repair_left, repair_right)
+                graft_plan = (base_len, grafts)
                 if base_len > 0:
                     cache = slice_cache(base_cache, base_len, self.model.config)
         elif use_kv_cache and reuse_prefixes:
@@ -363,9 +359,8 @@ class LLMEngine:
             # 若子输出正好到 prompt 末尾, 用最后 1 个 token 的前向拿 logits
             # (与 LCP 整段命中的处理一致), 此时 cache 长度 n-1, 前向后补到 n.
             if graft_plan is not None:
-                base_len, plan_grafts, _repair_left, _repair_right = graft_plan
+                base_len, plan_grafts = graft_plan
                 device = self.model.device
-                repair_n = max(0, self.config.graft_recompute_window)
                 total_graft_tokens = sum(len(g.tokens) for g in plan_grafts)
                 first_p = plan_grafts[0].position
                 last_end = max(g.position + len(g.tokens) for g in plan_grafts)
@@ -375,8 +370,8 @@ class LLMEngine:
                 grafted_tokens = 0
                 for item in plan_grafts:
                     p, L = item.position, len(item.tokens)
-                    left_trim = min(repair_n, L)
-                    right_trim = min(repair_n, max(0, L - left_trim))
+                    left_trim, right_trim = repair_token_counts(
+                        L, self.config.repair_window_begin, self.config.repair_window_end)
                     graft_start = p + left_trim
                     graft_len = L - left_trim - right_trim
                     if graft_len <= 0:
@@ -418,7 +413,8 @@ class LLMEngine:
                     )
                     reuse_len = max(0, skipped - 1)  # 最后 1 个 token 需要前向拿 logits
                 rebase_note = " + RoPE rebase" if self.config.graft_rope_rebase else ""
-                repair_note = (f", 每段边界重算 {repair_n} tok" if repair_n else "")
+                repair_note = (f", 每段首部重算 {self.config.repair_window_begin:.1%}, "
+                               f"尾部重算 {self.config.repair_window_end:.1%}")
                 logger.info(
                     "请求 %s: 拼接子 agent 输出 KV %d/%d 段, %d/%d tok(位置 %d..%d)%s%s + "
                     "复用 main 历史 KV %d tok, 剩余 %d tok prefill",

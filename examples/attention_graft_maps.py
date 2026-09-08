@@ -31,6 +31,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from lminfer.kvcache import concat_cache, rebase_rope_cache, slice_cache, tail_cache
+from lminfer.repair import repair_ratio, repair_token_counts
 
 
 @dataclass
@@ -63,7 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sub-max-new-tokens", type=int, default=96)
     parser.add_argument("--layer-stride", type=int, default=4)
     parser.add_argument("--layers", default=None, help="Comma-separated layer ids. Overrides --layer-stride.")
-    parser.add_argument("--repair-window", type=int, default=8)
+    for edge in ("begin", "end"):
+        parser.add_argument(f"--repair-window-{edge}", type=repair_ratio, default=0.0,
+                            help=f"Fraction of graft tokens to recompute at {edge} "
+                                 "([0, 1], rounded down; default: 0, disabled).")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -213,7 +217,8 @@ def generate_with_records(
     graft_cache: DynamicCache | None = None,
     graft_source_start: int = 0,
     graft_start: int = -1,
-    repair_window: int = 0,
+    repair_window_begin: float = 0.0,
+    repair_window_end: float = 0.0,
     max_new_tokens: int = 64,
     temperature: float = 0.0,
     top_p: float = 1.0,
@@ -257,9 +262,8 @@ def generate_with_records(
                 cache = concat_cache(cache, graft_cache, model.config)
                 out = prefill_span(graft_start + graft_len, prompt_len) or out
             elif mode == "rebase_recompute":
-                rw = max(0, repair_window)
-                left = min(rw, graft_len)
-                right = min(rw, max(0, graft_len - left))
+                left, right = repair_token_counts(
+                    graft_len, repair_window_begin, repair_window_end)
                 middle_start = graft_start + left
                 middle_end = graft_start + graft_len - right
                 out = prefill_span(0, middle_start)
@@ -563,7 +567,8 @@ def main() -> None:
             graft_cache=graft_cache,
             graft_source_start=graft_source_start,
             graft_start=graft_start,
-            repair_window=args.repair_window,
+            repair_window_begin=args.repair_window_begin,
+            repair_window_end=args.repair_window_end,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
@@ -575,7 +580,8 @@ def main() -> None:
     metadata = {
         "model": args.model,
         "selected_layers": selected_layers,
-        "repair_window": args.repair_window,
+        "repair_window_begin": args.repair_window_begin,
+        "repair_window_end": args.repair_window_end,
         "question": args.question,
         "subagent_output": sub_text,
         "prompt_tokens": len(final_prompt_ids),

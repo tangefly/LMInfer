@@ -320,6 +320,14 @@ lminfer serve /path/to/model --reuse-agent-kv-append
 是对齐的，且 main 历史部分仍走 LCP 精确复用 —— 这是"跨请求 KV 直通"的
 朴素实现，正确性边界见下方日志与一致性实验。
 
+可使用 `--repair-window-begin 0.15 --repair-window-end 0.20` 独立设置每段复用
+KV 首尾的重计算比例。例如匹配到 100 token 时，首部重算 15 个、尾部重算 20 个，
+仅拼接中间 65 个 token 的 KV。比例范围为 `[0, 1]`，按每段匹配长度计算并向下
+取整；首尾重叠时整段重算，不重复计算。服务端两项默认均为 `0`（关闭重算）。
+这些参数替代原服务端 `--graft-recompute-window`；attention 示例中的
+`--repair-window` 也替换为这两项，示例默认也均为 `0`。只配置一项时，另一端不重算；
+两项都不配置时，不进行首尾 KV 重算。
+
 ```bash
 # 服务日志会显示定位、拼接与复用
 #   会话 xxx: 共定位 3/3 段子 agent 输出 KV, 准备多段拼接

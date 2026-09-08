@@ -5,6 +5,7 @@
 """
 
 from dataclasses import dataclass, field
+from .repair import repair_ratio
 
 
 @dataclass
@@ -37,10 +38,15 @@ class EngineConfig:
                                          # 上下文里计算, 与全量 prefill 存在近似差异
     graft_rope_rebase: bool = False      # 拼接前把子输出 K 从子上下文 RoPE 位置重映射到
                                          # main prompt 位置; 只修正位置差, 不修正上下文差
-    graft_recompute_window: int = 0      # >0 时重算 [graft_position-N, suffix_start+N)
-                                         # 的 KV, 用 main 上下文修正拼接点附近 KV gap
+    repair_window_begin: float = 0.0    # 每段复用 KV 首部重算比例 [0, 1]
+    repair_window_end: float = 0.0      # 每段复用 KV 尾部重算比例 [0, 1]
     kv_segment_idle_ttl: float = 3600.0  # 已保存 KV 段的会话闲置超时(秒): 超过后整段清理,
                                          # 防止会话注册表无 TTL 导致 KV 显存随会话永久增长
+
+
+    def __post_init__(self):
+        self.repair_window_begin = repair_ratio(self.repair_window_begin)
+        self.repair_window_end = repair_ratio(self.repair_window_end)
 
 
 @dataclass
