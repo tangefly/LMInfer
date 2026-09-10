@@ -17,7 +17,7 @@ logger = logging.getLogger("lminfer")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lminfer",
-        description="基于 transformers 的朴素 LLM 推理服务(用于 KV Cache 理论学习)",
+        description="支持 Transformers / vLLM 后端的 agent KV 复用推理服务",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -34,6 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--dtype", default="auto",
                          choices=["auto", "bfloat16", "float16", "float32"])
+    p_serve.add_argument("--backend", choices=["transformers", "vllm"], default="transformers",
+                         help="推理后端; vllm 为单卡 Qwen3 dense 分段 KV 复用实现")
     p_serve.add_argument("--attn-implementation", default="auto",
                          choices=["auto", "eager", "sdpa", "flash_attention_2"],
                          help="attention 实现: auto 用 transformers 默认(sdpa); "
@@ -41,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--max-model-len", type=int, default=4096,
                          help="单序列最大总长度(prompt + 生成)")
     p_serve.add_argument("--max-num-seqs", type=int, default=4,
-                         help="最大并发请求数(朴素并发 = 线程数)")
+                         help="Transformers 并发线程数; vllm 后端第一版串行执行")
     p_serve.add_argument("--trust-remote-code", action="store_true")
     p_serve.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=None,
                          help="给 apply_chat_template 传 enable_thinking 开关(Qwen3 等): "
@@ -49,13 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
                               "都不传则走模板默认(不传该参数)")
     p_serve.add_argument("--disable-log-stats", action="store_true")
 
-    # ---- 为兼容 vLLM 命令而接受、但朴素实现不生效的参数 ----
-    for name, desc in [
-        ("--gpu-memory-utilization", "KV cache 由 transformers 动态管理, 无需预分显存"),
-        ("--tensor-parallel-size", "朴素实现只支持单卡"),
-        ("--kv-transfer-config", "朴素实现不接入 KV 传输(如 LMCache)"),
-    ]:
-        p_serve.add_argument(name, default=None, help=f"兼容 vLLM 参数; {desc}.")
+    p_serve.add_argument("--gpu-memory-utilization", type=float, default=None,
+                         help="vllm 模型和 paged KV 显存预算比例(默认 0.5); 会话快照另占显存; Transformers 忽略")
+    p_serve.add_argument("--tensor-parallel-size", type=int, default=None,
+                         help="vllm 后端当前只支持 1; Transformers 忽略")
+    p_serve.add_argument("--kv-transfer-config", default=None,
+                         help="兼容参数; Transformers 忽略; vllm 后端使用内置 agent connector, 不接受覆盖")
     p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "llama3_json", "none"], default=None,
                          help="工具调用解析: auto 自动识别模型家族(Qwen/Hermes 系解析 "
                               "<tool_call> 块, Llama 3.x 系解析 {\"name\":...,\"parameters\":...} "
@@ -117,8 +118,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
         ("tensor_parallel_size", "朴素实现只支持单卡"),
         ("kv_transfer_config", "朴素实现不接入 KV 传输(如 LMCache)"),
     ]:
-        if getattr(args, name, None):
+        if getattr(args, name, None) and args.backend == "transformers":
             logger.warning("--%s 在朴素实现中不生效: %s", name.replace("_", "-"), desc)
+    if args.backend == "vllm" and args.kv_transfer_config is not None:
+        raise SystemExit("vllm backend owns its KVConnector; --kv-transfer-config cannot be combined")
 
     from .config import EngineConfig
     from .server import run_server
@@ -129,6 +132,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     config = EngineConfig(
         model=model,
+        backend=args.backend,
+        gpu_memory_utilization=float(args.gpu_memory_utilization) if args.gpu_memory_utilization is not None else 0.5,
+        tensor_parallel_size=int(args.tensor_parallel_size) if args.tensor_parallel_size is not None else 1,
         dtype=args.dtype,
         attn_implementation=args.attn_implementation,
         max_model_len=args.max_model_len,

@@ -326,7 +326,8 @@ class SessionKVStore:
             cache: DynamicCache, prompt_len: int = 0,
             think_len: int = 0,
             trace: list[str] | None = None,
-            exact_prefix_len: int | None = None) -> bool:
+            exact_prefix_len: int | None = None,
+            clear_subs_on_main: bool = True) -> bool:
         """保存一次请求的完整序列 KV; 返回是否保存成功.
 
         seq_tokens 必须与 cache 长度一致(prompt + 输出, 位置从 0 开始),
@@ -336,6 +337,9 @@ class SessionKVStore:
         sub agent invocation 覆盖保存。也就是说同一个 sub 内部多次模型调用
         只保留最终/最新一整段 KV, 不拆成多个候选段。
         每次 put 顺带按 idle_ttl 清扫闲置会话段.
+
+        clear_subs_on_main=False 用于已经通过 take_main_reuse 接管旧 sub
+        批次的请求，避免完成时删除期间新到达的 sub。
 
         prompt_len / think_len: 拼接模式用 —— 记录输出 KV 的起始位置与
         输出开头 <think> 块的 token 数, 拼接时据此切出/剔除对应 KV.
@@ -359,7 +363,8 @@ class SessionKVStore:
                           exact_prefix_len=exact_prefix_len)
         if kind == KIND_MAIN:
             segs["main"] = prefix
-            self.clear_subs(session_id)
+            if clear_subs_on_main:
+                self.clear_subs(session_id)
         else:
             subs = segs.setdefault("subs", [])
             assert isinstance(subs, list)
@@ -527,6 +532,24 @@ class SessionKVStore:
         """兼容旧调用: 返回最后一段可拼接的子 agent 输出 KV."""
         grafts = self.build_grafts(session_id, trace, prompt_tokens)
         return grafts[-1] if grafts else None
+
+    def take_main_reuse(self, session_id: str, trace: list[str],
+                        prompt_tokens: list[int], *, append: bool):
+        """Transfer this sub batch to a main request, on the server event loop.
+
+        The returned lists own the request's references. The engine consumes
+        them after copying the chosen prefix and each graft. New sub arrivals
+        stay in the store and must not be cleared when this main finishes.
+        Failed requests can retry by recomputing from their prompt text.
+        """
+        if not trace or trace[-1] != KIND_MAIN:
+            raise ValueError("Only main requests can consume a sub batch")
+        grafts = self.build_grafts(session_id, trace, prompt_tokens) if append else []
+        prefixes = self.propose(session_id, trace)
+        segs = self._segments.get(session_id)
+        if segs is not None:
+            segs["subs"] = []
+        return prefixes, grafts
 
     def propose(self, session_id: str, trace: list[str]) -> list[KVPrefix]:
         """给出可尝试复用的候选段(空列表 = 本次不尝试).

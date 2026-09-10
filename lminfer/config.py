@@ -51,7 +51,24 @@ class EngineConfig:
                                          # 防止会话注册表无 TTL 导致 KV 显存随会话永久增长
 
 
+    backend: str = "transformers"
+    gpu_memory_utilization: float = 0.5
+    tensor_parallel_size: int = 1
+
     def __post_init__(self):
+        if self.backend not in ("transformers", "vllm"):
+            raise ValueError("backend must be transformers or vllm")
+        if not 0 < self.gpu_memory_utilization < 1:
+            raise ValueError("gpu_memory_utilization must be in (0, 1)")
+        if self.backend == "vllm":
+            if self.max_model_len < 2:
+                raise ValueError("vllm backend requires max_model_len >= 2")
+            if self.tensor_parallel_size != 1:
+                raise ValueError("vllm agent KV backend currently requires tensor_parallel_size=1")
+            if self.repair_mode == "context":
+                raise ValueError("vllm backend supports window/exact repair; context repair is not implemented")
+            if self.dtype == "float32":
+                raise ValueError("vllm agent KV backend requires float16 or bfloat16")
         self.repair_window_begin = repair_ratio(self.repair_window_begin)
         self.repair_window_end = repair_ratio(self.repair_window_end)
         if self.repair_mode not in ("window", "context", "exact"):

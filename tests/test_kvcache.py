@@ -32,6 +32,27 @@ def make_cache(length: int) -> DynamicCache:
 
 
 class SessionKVStoreTest(unittest.TestCase):
+
+    def test_take_main_reuse_transfers_old_batch_and_preserves_new_subs(self):
+        import weakref
+        store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
+        store.put("s", KIND_MAIN, [1, 2], make_cache(2))
+        store.put("s", KIND_SUB, [8, 101, 102, 103, 104], make_cache(5), prompt_len=1)
+        original = weakref.ref(store._segments["s"]["subs"][0].cache.layers[0].keys)
+        prefixes, grafts = store.take_main_reuse(
+            "s", ["main", "sub", "main"], [1, 2, 900, 101, 102, 103, 104, 901],
+            append=True)
+        self.assertEqual(len(prefixes), 2)
+        self.assertEqual(len(grafts), 1)
+        self.assertEqual(len(store.propose("s", ["main"])), 1)
+        self.assertIsNotNone(original())  # owned by the main request until selection
+        prefixes.clear()
+        self.assertIsNone(original())
+        self.assertEqual(grafts[0].cache.get_seq_length(), 4)  # independent copy
+        store.put("s", KIND_SUB, [9, 201, 202, 203, 204], make_cache(5), prompt_len=1)
+        store.put("s", KIND_MAIN, [1, 2, 3], make_cache(3), clear_subs_on_main=False)
+        self.assertEqual([p.tokens for p in store.propose("s", ["main"])],
+                         [[1, 2, 3], [9, 201, 202, 203, 204]])
     def test_build_grafts_reuses_all_subs_since_latest_main(self):
         store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
         session_id = "s1"

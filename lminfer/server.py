@@ -121,6 +121,10 @@ def create_app(engine: LLMEngine) -> FastAPI:
         yield _chunk({"role": "assistant"}, None)
         while True:
             kind, payload = await queue.get()
+            if kind == "error":
+                yield _sse({"error": {"message": payload, "type": "inference_error"}})
+                yield "data: [DONE]\n\n"
+                return
             if kind == "done":
                 r: GenerationResult = payload
                 if on_done is not None:
@@ -143,6 +147,10 @@ def create_app(engine: LLMEngine) -> FastAPI:
         base = _base(f"cmpl-{req_id}")
         while True:
             kind, payload = await queue.get()
+            if kind == "error":
+                yield _sse({"error": {"message": payload, "type": "inference_error"}})
+                yield "data: [DONE]\n\n"
+                return
             if kind == "done":
                 r: GenerationResult = payload
                 yield _sse({**base, "object": "text_completion",
@@ -262,15 +270,23 @@ def create_app(engine: LLMEngine) -> FastAPI:
         if prompt_ids.shape[1] > r.prompt_tokens:
             logger.info("请求 %s: prompt 被截断(%d -> %d tok), 跳过 KV 保存",
                         r.request_id, prompt_ids.shape[1], r.prompt_tokens)
-            if kind == KIND_MAIN and attempted:
+            if kind == KIND_MAIN and attempted and engine.config.backend != "vllm":
                 kv_store.clear_subs(session_id)
             return
         seq_tokens = prompt_ids[0][-r.prompt_tokens:].tolist() + r.output_tokens
+        # vLLM's final sampled token may not yet have KV. Store only the
+        # contiguous interval actually captured by the connector.
+        if engine.config.backend == "vllm":
+            valid = r.kv_cache.get_seq_length()
+            if not r.prompt_tokens <= valid <= len(seq_tokens):
+                raise RuntimeError("vLLM KV snapshot does not align with output tokens")
+            seq_tokens = seq_tokens[:valid]
         # prompt_len/think_len 用于拼接模式: 记录输出 KV 起始位置与开头
         # <think> 块的 token 数, 拼接时切出/剔除对应 KV
         kv_store.put(session_id, kind, seq_tokens, r.kv_cache,
                      prompt_len=r.prompt_tokens, think_len=r.output_think_tokens,
-                     trace=trace, exact_prefix_len=r.exact_prefix_len)
+                     trace=trace, exact_prefix_len=r.exact_prefix_len,
+                     clear_subs_on_main=engine.config.backend != "vllm")
 
     # ------------------------------------------------------------------
     # 路由
@@ -401,7 +417,15 @@ def create_app(engine: LLMEngine) -> FastAPI:
         #                            输出正文, 把其 KV 直接插进 main 的 KV cache;
         #                            main 段同时作为拼接基础与回退候选(定位失败回退 LCP)
         reuse_prefixes, graft = None, None
-        if session_id is not None and engine.config.reuse_agent_kv_append:
+        consume_reuse = (
+            session_id is not None and engine.config.backend == "vllm"
+            and req.trace[-1] == KIND_MAIN
+            and (engine.config.reuse_agent_kv or engine.config.reuse_agent_kv_append))
+        if consume_reuse:
+            reuse_prefixes, graft = kv_store.take_main_reuse(
+                session_id, req.trace, prompt_ids[0].tolist(),
+                append=engine.config.reuse_agent_kv_append)
+        elif session_id is not None and engine.config.reuse_agent_kv_append:
             prompt_tokens = prompt_ids[0].tolist()
             graft = kv_store.build_grafts(session_id, req.trace, prompt_tokens)
             reuse_prefixes = kv_store.propose(session_id, req.trace)
@@ -410,6 +434,9 @@ def create_app(engine: LLMEngine) -> FastAPI:
 
         sampling = req.to_sampling()
         req_id = uuid.uuid4().hex[:12]
+        # Capture before the inference thread consumes the request-owned lists.
+        attempted = bool(reuse_prefixes) or bool(graft)
+        reuse_options = {"consume_reuse": True} if consume_reuse else {}
 
         if req.stream:
             # 配置解析器与模型协议冲突时直接按原生协议切流: 显式配置的解析器
@@ -420,12 +447,11 @@ def create_app(engine: LLMEngine) -> FastAPI:
             queue = await engine.generate(req_id, prompt_ids, sampling, stream=True,
                                           skip_special_tokens=not parse_tools,
                                           reuse_prefixes=reuse_prefixes,
-                                          graft=graft)
+                                          graft=graft, **reuse_options)
             extra, on_done = None, None
             if session_id is not None:
                 # 每个 SSE chunk 顶层都带会话字段; 生成结束(done)时累计用量并保存 KV
                 extra = {"session_id": session_id, "trace": req.trace}
-                attempted = bool(reuse_prefixes) or graft is not None
                 kv_reuse_on = engine.config.reuse_agent_kv or engine.config.reuse_agent_kv_append
 
                 def on_done(r):
@@ -440,7 +466,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
         r = await engine.generate(req_id, prompt_ids, sampling,
                                   skip_special_tokens=not parse_tools,
                                   reuse_prefixes=reuse_prefixes,
-                                  graft=graft)
+                                  graft=graft, **reuse_options)
         if parse_tools:
             # 解析器按模型家族选择(见 model_adapters.py): auto 自动识别原生协议;
             # 显式配置与模型协议冲突时, 配置解析器识别不到任何输出, 自动回退
@@ -469,7 +495,6 @@ def create_app(engine: LLMEngine) -> FastAPI:
         if session_id is not None:
             agent_sessions.record_usage(session_id, r.prompt_tokens, r.completion_tokens)
             if engine.config.reuse_agent_kv or engine.config.reuse_agent_kv_append:
-                attempted = bool(reuse_prefixes) or graft is not None
                 _agent_kv_finish(session_id, req.trace, prompt_ids, r, attempted)
             resp["session_id"] = session_id
             resp["trace"] = req.trace
@@ -489,6 +514,8 @@ def create_app(engine: LLMEngine) -> FastAPI:
     async def stats():
         return {
             "model": engine.model_name,
+            "backend": engine.config.backend,
+            "execution_max_num_seqs": 1 if engine.config.backend == "vllm" else engine.config.max_num_seqs,
             "kv_bytes_per_token": engine.kv_bytes_per_token,
             "kv_mib_per_token": engine.kv_bytes_per_token / (1024 ** 2),
             "max_num_seqs": engine.config.max_num_seqs,
@@ -513,6 +540,14 @@ def run_server(config: EngineConfig, host: str = "0.0.0.0", port: int = 8000):
     """加载引擎并启动 uvicorn(供 cli 调用)."""
     import uvicorn
 
-    engine = LLMEngine(config)
+    if config.backend == "vllm":
+        from .vllm_engine import VLLMEngine
+        engine = VLLMEngine(config)
+    else:
+        engine = LLMEngine(config)
     app = create_app(engine)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    finally:
+        if config.backend == "vllm":
+            engine.close()

@@ -1,5 +1,10 @@
 # LMInfer
 
+现已支持实验性 `--backend vllm`：LMInfer 保留 agent KV 复用层，
+vLLM 执行单卡 dense Qwen3 的分段 prefill、KV 拼接、首尾重算和 decode。
+启动方式、实现边界及真实 GPU 验收见 [vLLM 后端说明](docs/vllm_backend.md)。
+默认仍使用下文介绍的 Transformers 后端。
+
 一个刻意保持**朴素**（naive）的 LLM 推理服务，用于学习与验证 **KV Cache** 相关理论。
 常规生成使用 transformers 的高层 API（模型加载、`DynamicCache`、采样 warper、chat template），
 实验性上下文 KV 修复增加了 Qwen3 按层执行路径，
