@@ -11,9 +11,14 @@ LMInfer 只依赖 transformers 的高层 API, 但不同模型家族在工具调�
 
 `--tool-call-parser` 的默认值 auto 在这里解析成具体解析器(依据 tokenizer 的
 特殊 token 自动识别), 显式指定(hermes/qwen/llama3_json/none)则原样使用.
+显式指定与模型家族协议冲突时(如 Llama 3.x 模型配 hermes), 启动时告警,
+请求时先按显式配置解析、失败再按模型原生协议回退解析(见 ModelProfile).
 """
 
+import logging
 from dataclasses import dataclass
+
+logger = logging.getLogger("lminfer")
 
 TOOL_CALL_START = "<tool_call>"
 LLAMA_PYTHON_TAG = "<|python_tag|>"
@@ -24,6 +29,7 @@ class ModelProfile:
     """一次服务启动解析出的模型适配参数."""
 
     tool_parser: str  # "hermes" | "llama3_json" | "none": 实际生效的工具调用解析器
+    native_parser: str  # 模型家族原生协议解析器(auto 的识别结果), 冲突回退用
     arguments_as_dict: bool  # True: 模板把 OpenAI arguments(JSON 字符串)当对象渲染。
                              # Llama 3.x 模板写 `tool_call.arguments | tojson`,
                              # 传 JSON 字符串会被加引号变成 "parameters": "{\"city\": ...}",
@@ -31,6 +37,20 @@ class ModelProfile:
     wrap_tool_output: bool   # True: 工具结果(content 字符串)渲染成 {"output": ...}。
                              # Llama 3.x 模板的 ipython 块对字符串直接 | tojson 会加引号,
                              # 包成对象后与模型训练时的工具结果格式一致;
+
+    @property
+    def fallback_parser(self) -> str | None:
+        """显式配置与模型家族协议冲突时的回退解析器; 无冲突返回 None.
+
+        配置了与模型家族不符的解析器(如 Llama 3.x 模型配 hermes)时, 该解析器
+        对模型输出永远解析不出结果, 工具调用会静默丢失 —— 请求时先按显式
+        配置解析, 解析不到再按原生协议解析一次(见 toolcalls.parse_model_output),
+        显式配置不被丢弃, 工具调用也不丢.
+        """
+        if (self.tool_parser in ("none", self.native_parser)
+                or self.native_parser == "none"):
+            return None
+        return self.native_parser
 
 
 def _has_special_token(tokenizer, token: str) -> bool:
@@ -61,9 +81,21 @@ def resolve_model_profile(configured_parser: str, tokenizer,
                           model_config=None) -> ModelProfile:
     """解析出本次服务实际使用的模型适配参数(见 ModelProfile)."""
     parser = resolve_tool_parser(configured_parser, tokenizer)
+    native = resolve_tool_parser("auto", tokenizer)
+    if parser != native and native != "none" and parser != "none":
+        # 显式解析器与模型家族协议冲突: 解析器对模型输出永远解析不出结果,
+        # 工具调用会整段漏进 content, 客户端拿不到 tool_calls(只会看到原始
+        # 文本, 多轮 agent 场景直接退化成死循环). 请求时按原生协议兜底解析.
+        logger.warning(
+            "--tool-call-parser %s 与模型家族协议(%s)不匹配: 该解析器识别不了 "
+            "这个模型的工具调用输出(如 Llama 3.x 的 <|python_tag|> JSON 不会被 "
+            "hermes 块解析器匹配). 请求时会按模型原生协议回退解析; 建议改用 "
+            "--tool-call-parser auto 或 %s",
+            configured_parser, native, native)
     llama3 = _has_special_token(tokenizer, LLAMA_PYTHON_TAG)
     return ModelProfile(
         tool_parser=parser,
+        native_parser=native,
         arguments_as_dict=llama3,
         wrap_tool_output=llama3,
     )

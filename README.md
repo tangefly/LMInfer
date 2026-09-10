@@ -115,7 +115,8 @@ python examples/bench.py --prompts 8 --max-tokens 64
 与 vLLM 的命令完全兼容，可直接照搬 `commands.txt` 里的启动方式：
 
 ```bash
-lminfer serve /path/to/model --enable-auto-tool-choice --tool-call-parser hermes
+lminfer serve /path/to/model --enable-auto-tool-choice --tool-call-parser hermes   # Qwen/Hermes 系
+lminfer serve /path/to/model --enable-auto-tool-choice                             # Llama 3.x 系(或任意模型: auto)
 ```
 
 两个参数的语义与 vLLM 一致：
@@ -129,7 +130,12 @@ lminfer serve /path/to/model --enable-auto-tool-choice --tool-call-parser hermes
     `{"name": ..., "parameters": ...}` JSON 工具调用（可多个、以 `;` 分隔、周围
     允许普通文本），对应 vLLM 的 `--tool-call-parser llama3_json`；
   - 都没有则 `none` 关闭解析，输出按普通文本返回。
-  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `none` 强制使用某解析器。
+  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `none` 强制使用某解析器，
+  但注意 **`hermes` 只能解析 `<tool_call>` 块、`llama3_json` 只能解析 JSON 调用**：
+  给 Llama 3.x 模型配 `hermes`（或反之）会解析不到任何工具调用，工具调用文本会
+  整段漏进 `content`、客户端拿不到 `tool_calls`。为避免这类静默失效，显式配置与
+  模型家族冲突时服务会：启动时告警，请求时先按显式配置解析、解析不到再按模型
+  原生协议自动兜底（流式直接按原生协议切流）。建议直接用 `auto`。
 - **`--enable-auto-tool-choice`**：请求带 `tools` 但**未显式给 `tool_choice`** 时，
   默认按 `auto` 处理；不加该参数时默认 `none`（忽略 tools，模型按普通对话回复）。
   请求里显式的 `tool_choice` 始终优先，支持 `"auto"` / `"none"` / `"required"` /
@@ -139,7 +145,7 @@ lminfer serve /path/to/model --enable-auto-tool-choice --tool-call-parser hermes
 
 ### Llama 3.x 的适配点（`lminfer/model_adapters.py`）
 
-Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做了两件事：
+Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做了三件事：
 
 1. **JSON 工具调用解析**（`llama3_json`）：模型输出形如
    `{"name": "get_weather", "parameters": {"city": "上海"}}`（可能带 `<|python_tag|>`
@@ -153,6 +159,13 @@ Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做�
    引号。渲染前把 `arguments` 还原成 dict、工具结果包成 `{"output": ...}` 对象
    （与 vLLM 的 `tool_chat_template_llama3.1_json.jinja` 一致），模型才能读到
    合法的 JSON。
+3. **schema 感知的参数修复**（非流式）：Llama 3.x 模型经常把 array 参数输出成
+   字符串形式的 Python 列表（如 `"source_ids": "['S1']"`），客户端按 schema 校验
+   会拒绝执行，多轮 agent 场景下模型读不懂报错、直接退化死循环。解析时按请求
+   工具 schema 检查：schema 声明 `type: array` 且值是字符串时，尝试按 Python
+   字面量解析（`ast.literal_eval`，安全），成功且结果是列表则还原成真正的 JSON
+   数组再返回；修复改变了参数时 `arguments` 改用重序列化结果（不再逐位保留）。
+   hermes 块解析同样支持该修复；流式路径不做（分片无法整段重写）。
 
 ```bash
 # 带 tools 的请求: 模型会输出 <tool_call> 块, 服务端解析为 tool_calls 返回

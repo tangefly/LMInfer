@@ -60,7 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="工具调用解析: auto 自动识别模型家族(Qwen/Hermes 系解析 "
                               "<tool_call> 块, Llama 3.x 系解析 {\"name\":...,\"parameters\":...} "
                               "JSON); qwen/hermes 强制块解析; llama3_json 强制 JSON 解析; "
-                              "none 关闭. 默认 auto")
+                              "none 关闭. 默认 auto. 显式指定与模型家族冲突时(如 Llama 3.x "
+                              "配 hermes), 启动告警并按模型原生协议兜底解析")
     p_serve.add_argument("--enable-auto-tool-choice", action="store_true",
                          help="请求带 tools 且未显式给 tool_choice 时默认按 auto 处理"
                               "(不开启时默认 none, 忽略 tools; 与 vLLM 语义一致)")

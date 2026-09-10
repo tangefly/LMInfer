@@ -30,10 +30,7 @@ from .toolcalls import (
     THINK_BLOCK,
     LlamaJsonStreamSplitter,
     ToolCallStreamSplitter,
-    clean_content,
-    clean_llama3_json_content,
-    parse_llama3_json_tool_calls,
-    parse_tool_calls,
+    parse_model_output,
 )
 
 logger = logging.getLogger("lminfer")
@@ -368,6 +365,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
         # 具体解析器由模型适配层决定(--tool-call-parser auto 自动识别模型家族):
         #   hermes     : Qwen/Hermes 系, 解析 <tool_call> 块;
         #   llama3_json: Llama 3.x 系, 解析 {"name":..., "parameters":...} JSON.
+        # 显式配置与模型家族冲突时(如 Llama 配 hermes), 请求按原生协议兜底解析.
         parse_tools = bool(tools) and profile.tool_parser != "none"
 
         # 用 transformers 的 chat template 把消息列表渲染成 prompt(与参考脚本一致)
@@ -414,7 +412,10 @@ def create_app(engine: LLMEngine) -> FastAPI:
         req_id = uuid.uuid4().hex[:12]
 
         if req.stream:
-            splitter = (LlamaJsonStreamSplitter() if profile.tool_parser == "llama3_json"
+            # 配置解析器与模型协议冲突时直接按原生协议切流: 显式配置的解析器
+            # 对该模型的输出永远不匹配, 保留它只会让工具调用整段漏进 content
+            stream_parser = profile.fallback_parser or profile.tool_parser
+            splitter = (LlamaJsonStreamSplitter() if stream_parser == "llama3_json"
                         else ToolCallStreamSplitter()) if parse_tools else None
             queue = await engine.generate(req_id, prompt_ids, sampling, stream=True,
                                           skip_special_tokens=not parse_tools,
@@ -441,15 +442,21 @@ def create_app(engine: LLMEngine) -> FastAPI:
                                   reuse_prefixes=reuse_prefixes,
                                   graft=graft)
         if parse_tools:
-            if profile.tool_parser == "llama3_json":
-                # Llama 3.x: 模型输出 JSON 工具调用; 有 tool_calls 时 content 为
-                # null(vLLM 语义), 无 tool_calls 时返回文本(剥掉 <|python_tag|> 前缀)
-                tool_calls = parse_llama3_json_tool_calls(r.output_text)
-                content = None if tool_calls else (
-                    clean_llama3_json_content(r.output_text) or None)
-            else:
-                tool_calls = parse_tool_calls(r.output_text)
-                content = clean_content(r.output_text) or None
+            # 解析器按模型家族选择(见 model_adapters.py): auto 自动识别原生协议;
+            # 显式配置与模型协议冲突时, 配置解析器识别不到任何输出, 自动回退
+            # 原生协议再解析一次, 工具调用不会静默丢失. 有 tool_calls 时
+            # content 为 null(vLLM 语义), 无 tool_calls 时返回清理后的文本.
+            # 请求的工具 schema 用于修复模型格式滑移(如 Llama 把 array 参数
+            # 写成字符串形式的列表 "['S1']", 客户端会按 schema 拒绝执行)
+            schemas = {
+                t["function"]["name"]: t["function"].get("parameters")
+                for t in (tools or [])
+                if isinstance(t.get("function"), dict)
+                and isinstance(t["function"].get("parameters"), dict)
+            }
+            tool_calls, content = parse_model_output(
+                r.output_text, profile.tool_parser, profile.fallback_parser,
+                req_id, schemas)
         else:
             tool_calls, content = [], r.output_text
         message: dict = {"role": "assistant", "content": content}

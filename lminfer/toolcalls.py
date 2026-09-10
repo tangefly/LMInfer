@@ -12,10 +12,14 @@ vLLM 跑 Qwen3 用的 hermes parser 解析的就是这个格式):
 """
 from __future__ import annotations
 
+import ast
 import json
+import logging
 import re
 import uuid
 from typing import Any, Dict, List, Tuple
+
+logger = logging.getLogger("lminfer")
 
 TOOL_CALL_START = "<tool_call>"
 TOOL_CALL_END = "</tool_call>"
@@ -122,7 +126,37 @@ def _extract_raw_arguments(block: str) -> str | None:
     return None
 
 
-def _parse_call_block(block: str) -> Dict[str, Any] | None:
+def _repair_array_args(args: Dict[str, Any], schema: dict | None) -> bool:
+    """按 schema 把"字符串形式的列表"参数还原成真正的 JSON 数组, 返回是否有修改.
+
+    Llama 3.x 模型经常把 array 参数输出成字符串化的 Python 列表(如
+    "source_ids": "['S1']"), 客户端按 schema 校验会拒绝执行该调用, 多轮
+    agent 场景下模型又往往读不懂"必须给数组"的报错, 直接退化成死循环.
+    schema 声明 type=array 且值是字符串时, 尝试按 Python 字面量解析
+    (ast.literal_eval, 只接受字面量, 不会执行任意代码), 成功且结果是
+    列表则替换; 解析失败保持原样(原值仍是合法 JSON 字符串).
+    """
+    if not isinstance(schema, dict):
+        return False
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return False
+    changed = False
+    for key, spec in props.items():
+        if (not isinstance(spec, dict) or spec.get("type") != "array"
+                or not isinstance(args.get(key), str)):
+            continue
+        try:
+            value = ast.literal_eval(args[key])
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(value, list):
+            args[key] = value
+            changed = True
+    return changed
+
+
+def _parse_call_block(block: str, schema: dict | None = None) -> Dict[str, Any] | None:
     """把一个 <tool_call> 块内的 JSON 解析成 OpenAI 工具调用, 失败返回 None."""
     try:
         data = json.loads(block)
@@ -139,14 +173,18 @@ def _parse_call_block(block: str) -> Dict[str, Any] | None:
             args = {}
     if not isinstance(args, dict):
         args = {}
-    # 优先返回原始 JSON 子串(保真 round-trip), 提取失败才回退重序列化
-    raw_args = _extract_raw_arguments(block)
-    if raw_args is not None:
-        try:
-            json.loads(raw_args)
-        except json.JSONDecodeError:
-            raw_args = None
-    if raw_args is None:
+    # 优先返回原始 JSON 子串(保真 round-trip); schema 修复改变了参数时,
+    # 原始子串不再有效, 改用重序列化结果
+    if not _repair_array_args(args, schema):
+        raw_args = _extract_raw_arguments(block)
+        if raw_args is not None:
+            try:
+                json.loads(raw_args)
+            except json.JSONDecodeError:
+                raw_args = None
+        if raw_args is None:
+            raw_args = json.dumps(args, ensure_ascii=False)
+    else:
         raw_args = json.dumps(args, ensure_ascii=False)
     return {
         "id": f"call_{uuid.uuid4().hex[:16]}",
@@ -155,15 +193,29 @@ def _parse_call_block(block: str) -> Dict[str, Any] | None:
     }
 
 
-def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """扫描可见输出, 返回 OpenAI 格式的 tool_calls 列表(解析失败的块跳过)."""
+def parse_tool_calls(text: str, schemas: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """扫描可见输出, 返回 OpenAI 格式的 tool_calls 列表(解析失败的块跳过).
+
+    schemas: 函数名 -> parameters schema, 供 _repair_array_args 修复
+    "字符串形式的列表"参数; 为 None 时不做修复(原样返回模型输出).
+    """
     text = THINK_BLOCK.sub("", text)
     calls: List[Dict[str, Any]] = []
     for block in TOOL_CALL_BLOCK.findall(text):
-        call = _parse_call_block(block)
+        call = _parse_call_block(block, (schemas or {}).get(_block_name(block)))
         if call is not None:
             calls.append(call)
     return calls
+
+
+def _block_name(block: str) -> str:
+    """从 <tool_call> 块里取函数名(供 schema 查找; 解析失败返回空串)."""
+    try:
+        data = json.loads(block)
+    except json.JSONDecodeError:
+        return ""
+    name = data.get("name") if isinstance(data, dict) else None
+    return name if isinstance(name, str) else ""
 
 
 def clean_content(text: str) -> str:
@@ -287,11 +339,14 @@ def _extract_llama_raw_args(block: str) -> str | None:
     return None
 
 
-def _llama_call_from_obj(obj: Dict[str, Any], block: str) -> Dict[str, Any] | None:
+def _llama_call_from_obj(obj: Dict[str, Any], block: str,
+                         schema: dict | None = None) -> Dict[str, Any] | None:
     """把一个已解析的 Llama JSON 工具调用对象转成 OpenAI 格式, 失败返回 None.
 
     block 是对象对应的原始 JSON 子串(用于提取参数原始子串做 round-trip 保真).
     与 vLLM 语义一致: 必须有 "name" 键, 参数取 "parameters"(优先)或 "arguments".
+    schema: 该函数的 parameters schema, 供 _repair_array_args 修复
+    "字符串形式的列表"参数; 修复改变参数时原始子串失效, 改用重序列化结果.
     """
     name = obj.get("name") if isinstance(obj, dict) else None
     if not isinstance(name, str) or not name:
@@ -304,13 +359,16 @@ def _llama_call_from_obj(obj: Dict[str, Any], block: str) -> Dict[str, Any] | No
             args = {}
     if not isinstance(args, dict):
         args = {}
-    raw_args = _extract_llama_raw_args(block)
-    if raw_args is not None:
-        try:
-            json.loads(raw_args)
-        except json.JSONDecodeError:
-            raw_args = None
-    if raw_args is None:
+    if not _repair_array_args(args, schema):
+        raw_args = _extract_llama_raw_args(block)
+        if raw_args is not None:
+            try:
+                json.loads(raw_args)
+            except json.JSONDecodeError:
+                raw_args = None
+        if raw_args is None:
+            raw_args = json.dumps(args, ensure_ascii=False)
+    else:
         raw_args = json.dumps(args, ensure_ascii=False)
     return {
         "id": f"call_{uuid.uuid4().hex[:16]}",
@@ -319,12 +377,15 @@ def _llama_call_from_obj(obj: Dict[str, Any], block: str) -> Dict[str, Any] | No
     }
 
 
-def parse_llama3_json_tool_calls(text: str) -> List[Dict[str, Any]]:
+def parse_llama3_json_tool_calls(text: str,
+                                 schemas: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     """扫描可见输出, 提取 Llama 3.x JSON 工具调用.
 
     与 vLLM 的 llama3_json 解析一致: 用 JSONDecoder.raw_decode 从每个 { 处解析
     完整 JSON 对象(正确处理任意嵌套深度与字符串内的括号), 跳过已解析对象内部的
     {, 支持多个对象以 ; 分隔及周围任意文本. 解析失败/缺 name 键的对象跳过.
+    schemas: 函数名 -> parameters schema, 供 _repair_array_args 修复
+    "字符串形式的列表"参数; 为 None 时不做修复(原样返回模型输出).
     """
     text = THINK_BLOCK.sub("", text)
     calls: List[Dict[str, Any]] = []
@@ -339,7 +400,8 @@ def parse_llama3_json_tool_calls(text: str) -> List[Dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         end = start + n
-        call = _llama_call_from_obj(obj, text[start:end])
+        call = _llama_call_from_obj(obj, text[start:end], (schemas or {}).get(
+            obj.get("name") if isinstance(obj, dict) else None))
         if call is not None:
             calls.append(call)
     return calls
@@ -450,3 +512,56 @@ class LlamaJsonStreamSplitter:
         self._buf = ""
         self._state = "undecided"
         return events
+
+
+# ---------------------------------------------------------------------------
+# 解析器分派与协议冲突回退(server 用)
+# ---------------------------------------------------------------------------
+
+def parse_output_tool_calls(text: str, parser: str,
+                            schemas: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """按解析器名解析输出文本里的工具调用(qwen 与 hermes 是同一协议).
+
+    schemas: 函数名 -> parameters schema, 供两种解析器修复模型把 array
+    参数写成字符串列表的格式滑移; 为 None 时不做修复.
+    """
+    if parser == "llama3_json":
+        return parse_llama3_json_tool_calls(text, schemas)
+    return parse_tool_calls(text, schemas)
+
+
+def clean_output_content(text: str, parser: str) -> str:
+    """按解析器名剥掉输出里的工具调用标记/think 块, 返回对话内容."""
+    if parser == "llama3_json":
+        return clean_llama3_json_content(text)
+    return clean_content(text)
+
+
+def parse_model_output(text: str, parser: str, fallback_parser: str | None,
+                       request_id: str | None = None,
+                       schemas: Dict[str, Any] | None = None) -> Tuple[List[Dict[str, Any]], str | None]:
+    """把模型可见输出解析成 (tool_calls, content), 含协议冲突回退.
+
+    - 先按显式配置解析器解析; 解析不到且 fallback_parser 给出时, 按模型
+      原生协议再解析一次 —— 显式配置了与模型家族不符的解析器(如 Llama 3.x
+      配 hermes)时, 该解析器对模型输出永远解析不出结果, 不兜底的话工具调用
+      会整段漏进 content, 客户端永远拿不到 tool_calls(只会看到原始文本);
+    - 有 tool_calls 时 content 为 None(vLLM 语义), 否则返回清理后的文本;
+      清理语义跟随最终生效的解析器(冲突时按模型原生协议剥标记).
+    - schemas 供解析时做 schema 感知的参数修复(见 _repair_array_args),
+      流式路径不做修复(切流分片无法整段重写 arguments).
+    """
+    calls = parse_output_tool_calls(text, parser, schemas)
+    cleaner = parser
+    if not calls and fallback_parser is not None:
+        fb_calls = parse_output_tool_calls(text, fallback_parser, schemas)
+        if fb_calls:
+            logger.warning(
+                "tool-call-parser=%s 未识别到工具调用%s, 按模型原生协议 %s "
+                "解析出 %d 个(建议改用 --tool-call-parser auto 或 %s)",
+                parser, f"(请求 {request_id})" if request_id else "",
+                fallback_parser, len(fb_calls), fallback_parser)
+            calls = fb_calls
+        cleaner = fallback_parser
+    content = None if calls else (clean_output_content(text, cleaner) or None)
+    return calls, content
