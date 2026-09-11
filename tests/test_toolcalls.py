@@ -2,6 +2,7 @@ import json
 import unittest
 
 from lminfer.model_adapters import (
+    ToolResultWrapper,
     resolve_model_profile,
     resolve_tool_parser,
     resolve_tool_result_wrapper,
@@ -12,6 +13,7 @@ from lminfer.toolcalls import (
     MistralStreamSplitter,
     clean_output_content,
     make_stream_splitter,
+    parse_glm4_tool_calls,
     parse_mistral_tool_calls,
     parse_model_output,
     parse_output_tool_calls,
@@ -39,7 +41,16 @@ HERMES_TOK = _Tokenizer(["<tool_call>", "</tool_call>",
                          "<tool_response>", "</tool_response>"])
 MISTRAL_TOK = _Tokenizer(["[TOOL_CALLS]", "[ARGS]",
                           "[TOOL_RESULTS]", "[/TOOL_RESULTS]"])
+# GLM-4 tokenizer: 没有专用工具调用 token, 靠角色标记 + config.model_type 识别
+GLM4_ROLE_TOKENS = ["[gMASK]", "<sop>", "<|system|>", "<|user|>",
+                    "<|assistant|>", "<|observation|>"]
+GLM4_TOK = _Tokenizer(GLM4_ROLE_TOKENS)
 PLAIN_TOK = _Tokenizer([])
+
+
+class _Config:
+    def __init__(self, model_type):
+        self.model_type = model_type
 
 LLAMA_CALL = ('<|python_tag|>{"name": "research", "parameters": '
               '{"query": "What event did the institution hold in 2002?", '
@@ -65,12 +76,44 @@ class ToolParserResolutionTest(unittest.TestCase):
         self.assertEqual(resolve_tool_parser("auto", MISTRAL_TOK), "mistral")
         self.assertEqual(resolve_tool_parser("auto", PLAIN_TOK), "none")
 
+    def test_auto_detection_glm4_by_config_and_tokenizer(self):
+        # config.model_type 是权威信号(GLM-4-9B-0414 的 config)
+        self.assertEqual(resolve_tool_parser("auto", GLM4_TOK, _Config("glm4")),
+                         "glm4")
+        # 拿不到 config 时退化到 <|observation|> 特殊 token 探测
+        self.assertEqual(resolve_tool_parser("auto", GLM4_TOK), "glm4")
+        # 别的模型家族不会被误判
+        self.assertEqual(resolve_tool_parser("auto", HERMES_TOK, _Config("qwen3")),
+                         "hermes")
+        self.assertEqual(resolve_tool_parser("auto", PLAIN_TOK, _Config("llama")),
+                         "none")
+
+    def test_explicit_glm4_parser_kept(self):
+        self.assertEqual(resolve_tool_parser("glm4", PLAIN_TOK), "glm4")
+
     def test_tool_result_wrapper_detection(self):
         self.assertEqual(resolve_tool_result_wrapper(HERMES_TOK),
-                         ("<tool_response>", "</tool_response>"))
+                         ToolResultWrapper("<tool_response>", "</tool_response>"))
         self.assertEqual(resolve_tool_result_wrapper(MISTRAL_TOK),
-                         ("[TOOL_RESULTS]", "[/TOOL_RESULTS]"))
+                         ToolResultWrapper("[TOOL_RESULTS]", "[/TOOL_RESULTS]"))
+        # GLM-4 没有闭合标记: 窗口到下一个角色标记为止
+        glm4_wrapper = resolve_tool_result_wrapper(GLM4_TOK)
+        self.assertEqual(glm4_wrapper.open_marker, "<|observation|>")
+        self.assertIsNone(glm4_wrapper.close_marker)
+        self.assertIn("<|assistant|>", glm4_wrapper.terminators)
         self.assertIsNone(resolve_tool_result_wrapper(PLAIN_TOK))
+
+    def test_profile_sets_glm4_tool_protocol(self):
+        profile = resolve_model_profile("auto", GLM4_TOK, _Config("glm4"))
+        self.assertEqual(profile.native_parser, "glm4")
+        self.assertEqual(profile.tool_protocol, "glm4")
+        # 显式配置别的解析器时, 输出解析可以冲突, 但渲染协议必须仍是 GLM 原生
+        profile = resolve_model_profile("hermes", GLM4_TOK, _Config("glm4"))
+        self.assertEqual(profile.tool_parser, "hermes")
+        self.assertEqual(profile.fallback_parser, "glm4")
+        self.assertEqual(profile.tool_protocol, "glm4")
+        self.assertEqual(resolve_model_profile("auto", HERMES_TOK).tool_protocol,
+                         "openai")
 
     def test_mistral_common_backend_counts_as_having_a_template(self):
         # mistral-common 后端没有 chat_template 属性, 但 apply_chat_template 可用
@@ -319,5 +362,230 @@ class MistralStreamSplitterTest(unittest.TestCase):
         self.assertEqual([k for k, _ in events], ["tool_call"])
 
 
+class Glm4ToolCallTest(unittest.TestCase):
+    """GLM-4-0414 的 `name\\n{json}` 工具调用协议(实测输出形态)."""
+
+    # 真实模型输出(以 <|observation|> eos 结束; eos 不入 output_text)
+    GLM4_CALL = 'get_weather\n{"city": "北京"}'
+    SCHEMAS_GLM4 = {"get_weather": {"type": "object", "properties": {
+        "city": {"type": "string"}}}}
+
+    def test_real_output_parses_with_verbatim_arguments(self):
+        calls = parse_glm4_tool_calls(self.GLM4_CALL, self.SCHEMAS_GLM4)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        # arguments 逐位保留模型原始 JSON 子串: 回填后模板渲染的
+        # `get_weather\n{"city": "北京"}` 才能与生成流逐位一致(LCP 整段命中)
+        self.assertEqual(calls[0]["function"]["arguments"], '{"city": "北京"}')
+        self.assertEqual(calls[0]["type"], "function")
+
+    def test_parse_output_and_content_policy(self):
+        calls, content = parse_model_output(self.GLM4_CALL, "glm4", None,
+                                            schemas=self.SCHEMAS_GLM4)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(content)  # 纯工具调用没有前导正文
+        self.assertEqual(parse_output_tool_calls(self.GLM4_CALL, "glm4",
+                                                 self.SCHEMAS_GLM4)[0]
+                         ["function"]["name"], "get_weather")
+
+    def test_prefix_text_is_kept_for_kv_alignment(self):
+        calls, content = parse_model_output(
+            "让我查一下天气\n" + self.GLM4_CALL, "glm4", None,
+            schemas=self.SCHEMAS_GLM4)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, "让我查一下天气\n")
+
+    def test_normal_answer_is_not_a_tool_call(self):
+        # 实测第二轮回答(以 <|user|> eos 结束)
+        answer = "\n根据您的查询，北京今天的天气情况是晴，温度为28度。"
+        calls, content = parse_model_output(answer, "glm4", None,
+                                            schemas=self.SCHEMAS_GLM4)
+        self.assertEqual(calls, [])
+        self.assertEqual(content, answer.strip())
+
+    def test_call_acceptance_rules(self):
+        # 形态 1(输出开头): 模型直接以 `name\n{json}` 开头, 接受
+        self.assertEqual(len(parse_glm4_tool_calls(
+            'answer\n{"value": 42}', self.SCHEMAS_GLM4)), 1)
+        # 正文中间的同形排版(非白名单名): 不接受, 避免把计划 JSON 误判成调用
+        self.assertEqual(parse_glm4_tool_calls(
+            'The result is\nanswer\n{"value": 42}', self.SCHEMAS_GLM4), [])
+        # 正文中间但名字确实是本次声明的工具: 接受
+        self.assertEqual(len(parse_glm4_tool_calls(
+            'I will check.\nget_weather\n{"city": "北京"}',
+            self.SCHEMAS_GLM4)), 1)
+
+    def test_role_marker_form_from_real_research_output(self):
+        # GLM-4 真实输出: 决策正文之后跟 `<|assistant|>函数名\n{json}`(模型卡的
+        # 参考实现正是按 `<|assistant|>` split 后逐段解析)。未声明的函数名
+        # (research)也要在角色标记锚点上被认出来 —— 否则客户端拿不到 tool_calls,
+        # 主 agent 会一直空转到 turn budget 耗尽。
+        text = ('After inspecting S1, I found nothing.\n'
+                '<|assistant|>research\n'
+                '{"query": "q", "source_ids": ["S1"]}')
+        calls, content = parse_model_output(text, "glm4", None,
+                                            schemas={"search": {}, "read": {}})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "research")
+        self.assertEqual(calls[0]["function"]["arguments"],
+                         '{"query": "q", "source_ids": ["S1"]}')
+        self.assertEqual(content, "After inspecting S1, I found nothing.\n")
+
+    def test_malformed_arguments_are_not_a_call(self):
+        # JSON 没写完: 宁可留在 content, 也不抛出客户端无法执行的假调用
+        calls, content = parse_model_output('get_weather\n{"city": ',
+                                            "glm4", None,
+                                            schemas=self.SCHEMAS_GLM4)
+        self.assertEqual(calls, [])
+        self.assertEqual(content, 'get_weather\n{"city":')
+
+    def test_multiple_calls(self):
+        text = ('get_weather\n{"city": "北京"}\n'
+                'research\n{"query": "q"}')
+        calls = parse_glm4_tool_calls(
+            text, {"get_weather": {}, "research": {}})
+        self.assertEqual([c["function"]["name"] for c in calls],
+                         ["get_weather", "research"])
+        self.assertEqual(calls[1]["function"]["arguments"], '{"query": "q"}')
+
+    def test_schema_repairs_stringified_array(self):
+        calls = parse_glm4_tool_calls(
+            'research\n{"query": "q", "source_ids": "[\'S1\']"}', SCHEMAS)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["source_ids"], ["S1"])
+
+    def test_conflicting_parser_falls_back_to_glm4(self):
+        # 照抄别的模型的启动参数(hermes)时输出解析不丢: 按原生 glm4 兜底
+        calls, content = parse_model_output(self.GLM4_CALL, "hermes", "glm4",
+                                            schemas=self.SCHEMAS_GLM4)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertIsNone(content)
+        self.assertEqual(parse_output_tool_calls(self.GLM4_CALL, "hermes"),
+                         [])
+
+
+class Glm4StreamSplitterTest(unittest.TestCase):
+    def split(self, chunks):
+        splitter = make_stream_splitter("glm4")
+        events = []
+        for chunk in chunks:
+            events.extend(splitter.push(chunk))
+        events.extend(splitter.flush())
+        return events
+
+    def test_stream_splits_call(self):
+        events = self.split(["get_", "weather", "\n", '{"city": ', '"北京"}'])
+        self.assertEqual([k for k, _ in events], ["tool_call"])
+        call = events[0][1]
+        self.assertEqual(call["function"]["name"], "get_weather")
+        self.assertEqual(call["function"]["arguments"], '{"city": "北京"}')
+
+    def test_stream_normal_answer_passes_through(self):
+        events = self.split(["\n根据您的查询，", "北京今天是晴天。"])
+        self.assertEqual([k for k, _ in events], ["content", "content"])
+        self.assertEqual("".join(p for _, p in events),
+                         "\n根据您的查询，北京今天是晴天。")
+
+    def test_stream_word_then_newline_is_not_a_call(self):
+        events = self.split(["Sure", "\nHere is the answer"])
+        self.assertEqual([k for k, _ in events], ["content"])
+        self.assertEqual(events[0][1], "Sure\nHere is the answer")
+
+    def test_incomplete_call_flushed_as_text(self):
+        events = self.split(['get_weather\n{"city": '])
+        self.assertEqual([k for k, _ in events], ["content"])
+        self.assertEqual(events[0][1], 'get_weather\n{"city": ')
+
+    def test_stream_multiple_calls(self):
+        events = self.split(['get_weather\n{"city": "S"}\nresearch\n{"query": "q"}'])
+        calls = [p for k, p in events if k == "tool_call"]
+        self.assertEqual([c["function"]["name"] for c in calls],
+                         ["get_weather", "research"])
+
+    def test_tool_name_whitelist_suppresses_false_positive(self):
+        # 正文里"一行单词 + JSON 对象"的同形排版(非白名单名, 无角色标记): 按正文输出
+        splitter = make_stream_splitter("glm4", {"call_subagent"})
+        text = 'The result is\nanswer\n{"value": 42}'
+        events = list(splitter.push(text)) + list(splitter.flush())
+        self.assertEqual([k for k, _ in events], ["content"])
+        self.assertEqual("".join(p for _, p in events), text)
+
+    def test_stream_role_marker_call_after_prose(self):
+        # 真实 research 形态: 先正文, 再 `<|assistant|>name\n{json}`(名字未声明)
+        splitter = make_stream_splitter("glm4", {"delegate"})
+        chunks = ["After S1, I will delegate.", "<|assistant|>",
+                  "research\n", '{"query": "q"}']
+        events = []
+        for chunk in chunks:
+            events.extend(splitter.push(chunk))
+        events.extend(splitter.flush())
+        self.assertEqual([k for k, _ in events], ["content", "tool_call"])
+        self.assertEqual(events[0][1], "After S1, I will delegate.")
+        self.assertEqual(events[1][1]["function"]["name"], "research")
+
+    def test_stream_role_marker_before_plain_text_passes_through(self):
+        # `<|assistant|>` 后面不是调用形态(普通文本)时不能一直扣留到 flush
+        splitter = make_stream_splitter("glm4", {"delegate"})
+        events = list(splitter.push("<|assistant|>Bon")) + \
+            list(splitter.push("jour, voici la réponse.")) + list(splitter.flush())
+        self.assertEqual([k for k, _ in events], ["content"])
+        self.assertEqual(events[0][1], "<|assistant|>Bonjour, voici la réponse.")
+
+    def test_tool_name_whitelist_allows_real_call(self):
+        splitter = make_stream_splitter("glm4", {"call_subagent"})
+        events = list(splitter.push('call_subagent\n{"task": "q"}')) + \
+            list(splitter.flush())
+        self.assertEqual([k for k, _ in events], ["tool_call"])
+        self.assertEqual(events[0][1]["function"]["name"], "call_subagent")
+
+
+class Glm4MessageRenderingTest(unittest.TestCase):
+    """OpenAI 消息 -> GLM 原生消息的渲染翻译(tool_calls/metadata + observation)."""
+
+    def _messages(self):
+        from lminfer.schemas import ChatMessage
+        return [
+            ChatMessage(role="user", content="北京天气?"),
+            ChatMessage(role="assistant", content=None, tool_calls=[{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather",
+                             "arguments": '{"city": "北京"}'}}]),
+            ChatMessage(role="tool", tool_call_id="call_1", content="晴, 28 度"),
+        ]
+
+    def test_tool_calls_render_as_metadata_and_observation(self):
+        from lminfer.server import adapt_glm4_messages
+        out = adapt_glm4_messages(self._messages())
+        self.assertEqual(out, [
+            {"role": "user", "content": "北京天气?"},
+            {"role": "assistant", "metadata": "get_weather",
+             "content": '{"city": "北京"}'},
+            {"role": "observation", "content": "晴, 28 度"},
+        ])
+
+    def test_arguments_are_rendered_verbatim(self):
+        # content 必须原样是 arguments 字符串(模板直接 `{{ content }}` 渲染),
+        # 任何 json.dumps 归一化都会让下一轮渲染多/少空格、LCP 提前断开
+        from lminfer.server import adapt_glm4_messages
+        out = adapt_glm4_messages(self._messages())
+        self.assertEqual(out[1]["content"], '{"city": "北京"}')
+
+    def test_renders_with_real_glm4_tokenizer_if_available(self):
+        import os
+        model = "/home/tanger/workspace/models/GLM-4-9B-0414"
+        if not os.path.isdir(model):
+            self.skipTest("GLM-4-9B-0414 not present locally")
+        from transformers import AutoTokenizer
+        from lminfer.server import adapt_glm4_messages
+        tok = AutoTokenizer.from_pretrained(model)
+        text = tok.apply_chat_template(adapt_glm4_messages(self._messages()),
+                                       add_generation_prompt=True, tokenize=False)
+        # 工具调用与工具结果都真实进入 prompt(直接透传 OpenAI 字段会渲染成 None)
+        self.assertIn('<|assistant|>get_weather\n{"city": "北京"}', text)
+        self.assertIn("<|observation|>\n晴, 28 度", text)
+        self.assertNotIn("None", text)
+
+
 if __name__ == "__main__":
     unittest.main()
+

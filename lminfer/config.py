@@ -28,8 +28,10 @@ class EngineConfig:
     tool_call_parser: str = "auto"  # auto/qwen/hermes: 解析 <tool_call> 块; llama3_json:
                                     # 解析 Llama 3.x 的 {"name":...,"parameters":...} JSON;
                                     # mistral: 解析 [TOOL_CALLS]name[ARGS]{json};
-                                    # none: 关闭解析. auto 按模型 tokenizer 自动识别
-                                    # (见 model_adapters.py, 对应 vLLM 的 --tool-call-parser)
+                                    # glm4: 解析 GLM-4 的 name\n{json};
+                                    # none: 关闭解析. auto 按 config.model_type/tokenizer
+                                    # 自动识别(见 model_adapters.py, 对应 vLLM 的
+                                    # --tool-call-parser)
     enable_auto_tool_choice: bool = False  # 请求带 tools 且未显式给 tool_choice 时默认按 auto
                                            # 处理; 关闭时默认 none(忽略 tools). 显式 tool_choice
                                            # 始终优先(对应 vLLM 的 --enable-auto-tool-choice)

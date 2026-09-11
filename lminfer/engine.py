@@ -292,6 +292,15 @@ class LLMEngine:
         """
         # 截断 prompt, 保证总长度不超过 max_model_len
         max_prompt = self.config.max_model_len - sampling.max_tokens
+        if max_prompt < 1:
+            # max_tokens >= max_model_len 时没有空间留给 prompt: 原先会截断成空
+            # 序列, 在模型 forward 里报 "cannot reshape tensor of 0 elements" 这种
+            # 看不懂的错误。这里直接给出可操作的提示(提高 --max-model-len 或降低
+            # 请求的 max_tokens)。
+            raise ValueError(
+                f"max_tokens({sampling.max_tokens}) 不小于 max_model_len"
+                f"({self.config.max_model_len}), 没有空间留给 prompt: "
+                f"请提高 --max-model-len 或降低请求的 max_tokens")
         if prompt_ids.shape[1] > max_prompt:
             logger.warning("请求 %s: prompt %d tokens 超过上限 %d, 截断头部保留末尾",
                            request_id, prompt_ids.shape[1], max_prompt)

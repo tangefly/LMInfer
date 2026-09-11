@@ -306,6 +306,63 @@ class GraftWrapperTest(unittest.TestCase):
         self.assertEqual(len(store.propose("s", [KIND_MAIN])), 2)
 
 
+class Glm4FakeTokenizer:
+    """GLM-4 式 tokenizer: 工具结果用 <|observation|> 开启, 到下一个角色标记结束."""
+
+    ids = {"<|observation|>": 7, "<|assistant|>": 8, "<|user|>": 9,
+           "<|system|>": 10, "[gMASK]": 11, "<sop>": 12}
+
+    def convert_tokens_to_ids(self, token):
+        return self.ids.get(token, -1)
+
+    def convert_ids_to_tokens(self, token_id):
+        for token, tid in self.ids.items():
+            if tid == token_id:
+                return token
+        return f"tok_{token_id}"
+
+
+class Glm4GraftWrapperTest(unittest.TestCase):
+    """GLM-4 没有闭合标记: observation 窗口延伸到下一个角色标记."""
+
+    def test_observation_window_ends_at_next_role_marker(self):
+        store = SessionKVStore(config=None, tokenizer=Glm4FakeTokenizer())
+        main_tokens = [1, 2, 3]
+        self.assertTrue(store.put("s", KIND_MAIN, main_tokens, make_cache(3), prompt_len=3))
+        sub_out = [101, 102, 103, 104]
+        self.assertTrue(store.put("s", KIND_SUB, [9] + sub_out, make_cache(5), prompt_len=1))
+
+        # 渲染形态: <|assistant|>name\n{json}<|observation|>\n正文<|assistant|>
+        prompt = main_tokens + [7] + sub_out + [8]
+        grafts = store.build_grafts("s", [KIND_MAIN, "sub", KIND_MAIN], prompt)
+
+        self.assertEqual([g.tokens for g in grafts], [sub_out])
+        self.assertEqual([g.position for g in grafts], [4])
+        self.assertEqual([g.source_position for g in grafts], [1])
+
+    def test_next_observation_also_terminates_window(self):
+        store = SessionKVStore(config=None, tokenizer=Glm4FakeTokenizer())
+        self.assertTrue(store.put("s", KIND_MAIN, [1], make_cache(1), prompt_len=1))
+        first = [101, 102, 103, 104]
+        second = [201, 202, 203, 204]
+        self.assertTrue(store.put("s", KIND_SUB, [9] + first, make_cache(5), prompt_len=1))
+        self.assertTrue(store.put("s", KIND_SUB, [9] + second, make_cache(5), prompt_len=1))
+
+        prompt = [1, 7] + first + [7] + second + [8]
+        grafts = store.build_grafts("s", [KIND_MAIN, "sub", "sub", KIND_MAIN], prompt)
+        self.assertEqual([g.tokens for g in grafts], [first, second])
+
+    def test_window_without_terminator_extends_to_prompt_end(self):
+        store = SessionKVStore(config=None, tokenizer=Glm4FakeTokenizer())
+        self.assertTrue(store.put("s", KIND_MAIN, [1], make_cache(1), prompt_len=1))
+        sub_out = [101, 102, 103, 104]
+        self.assertTrue(store.put("s", KIND_SUB, [9] + sub_out, make_cache(5), prompt_len=1))
+
+        grafts = store.build_grafts("s", [KIND_MAIN, "sub", KIND_MAIN],
+                                    [1, 7] + sub_out)
+        self.assertEqual([g.tokens for g in grafts], [sub_out])
+
+
 class _SinusoidalRope(torch.nn.Module):
     """最小 RoPE 模块: 形状/约定与 transformers 的 RotaryEmbedding 一致."""
 
@@ -443,6 +500,101 @@ class Ministral3YarnRebaseTest(unittest.TestCase):
         # 相位错误不是舍入误差量级: 与正确答案相差 K 自身的量级
         error = (without_rope.layers[0].keys - at_target).abs().max()
         self.assertGreater(float(error), 1.0)
+
+
+class Glm4RopeRebaseTest(unittest.TestCase):
+    """用 GLM-4 真实的 RoPE 模块验证 rebase 相位(不需要权重).
+
+    GLM-4-9B-0414 声明 `partial_rotary_factor: 0.5`: 128 维 head 只有前 64 维旋转,
+    且 rotate_half 是**奇偶交错**(GPT-NeoX 式, cos/sin 用 repeat_interleave 展开)。
+    旧的"全 head_dim + 前后对半"实现会把拼接进来的 K 转到错误相位 —— 这个用例就是
+    那次适配的回归测试。
+    """
+
+    SOURCE, TARGET, LENGTH, HEAD_DIM = 1200, 2400, 6, 128
+    ROTARY_DIM = 64
+
+    @staticmethod
+    def _config():
+        from transformers import Glm4Config
+        return Glm4Config()
+
+    @staticmethod
+    def _rope():
+        from transformers import Glm4Config
+        from transformers.models.glm4.modeling_glm4 import Glm4RotaryEmbedding
+        return Glm4RotaryEmbedding(Glm4Config())
+
+    @staticmethod
+    def _keys_at(rope, keys, position):
+        """按模型自己的 apply_rotary_pos_emb 在给定绝对位置旋转 K(ground truth)."""
+        from transformers.models.glm4.modeling_glm4 import apply_rotary_pos_emb
+        positions = torch.full((1, keys.shape[-2]), position)
+        cos, sin = rope(keys, positions)
+        _, k_emb = apply_rotary_pos_emb(keys, keys, cos, sin)
+        return k_emb
+
+    def _cache(self, keys):
+        return DynamicCache(ddp_cache_data=[(keys.clone(), keys.clone())], config=None)
+
+    def test_rebase_matches_model_rope_at_target_position(self):
+        rope, config = self._rope(), self._config()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+        at_target = self._keys_at(rope, keys, self.TARGET)
+
+        rebased = rebase_rope_cache(self._cache(at_source), self.SOURCE, self.TARGET,
+                                    config, rope=rope)
+
+        torch.testing.assert_close(rebased.layers[0].keys, at_target,
+                                   atol=1e-5, rtol=1e-5)
+
+    def test_pass_through_dims_are_untouched(self):
+        # 后 64 维不参与旋转: rebase 不能碰它们
+        rope, config = self._rope(), self._config()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+
+        rebased = rebase_rope_cache(self._cache(at_source), self.SOURCE, self.TARGET,
+                                    config, rope=rope)
+
+        torch.testing.assert_close(
+            rebased.layers[0].keys[..., self.ROTARY_DIM:],
+            at_source[..., self.ROTARY_DIM:])
+
+    def test_plain_fallback_keeps_partial_interleaved_layout(self):
+        # 没有可调用 RoPE 模块时的默认公式也必须按 partial+interleaved 算:
+        # GLM-4 的 rope_type 是 default(no scaling), 所以两者数值应当一致
+        config = self._config()
+        rope = self._rope()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+        at_target = self._keys_at(rope, keys, self.TARGET)
+
+        rebased = rebase_rope_cache(self._cache(at_source), self.SOURCE, self.TARGET,
+                                    config, rope=None)
+
+        torch.testing.assert_close(rebased.layers[0].keys, at_target,
+                                   atol=1e-5, rtol=1e-5)
+
+    def test_full_dim_half_split_assumption_is_wrong(self):
+        # 旧实现的全 head_dim + 前后对半旋转偏离模型真实相位, 且偏差是 K 的量级
+        rope = self._rope()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+        at_target = self._keys_at(rope, keys, self.TARGET)
+        # 与 kvcache._plain_delta_cos_sin 的旧写法一致: 128 维全旋转 + half-split
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(
+            0, self.HEAD_DIM, 2, dtype=torch.float32) / self.HEAD_DIM))
+        positions = torch.full((self.LENGTH,), float(self.TARGET - self.SOURCE))
+        emb = torch.cat((torch.outer(positions, inv_freq),) * 2, dim=-1)
+        wrong = _rotate(at_source, emb.cos()[None], emb.sin()[None])
+
+        self.assertGreater(float((wrong - at_target).abs().max()), 1.0)
 
 
 if __name__ == "__main__":

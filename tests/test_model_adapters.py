@@ -9,13 +9,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from transformers import Mistral3Config, Qwen3Config
+from transformers import Glm4Config, Mistral3Config, Qwen3Config
 
 from lminfer import model_adapters
 from lminfer.model_adapters import (
     _is_finegrained_fp8,
     _supports_causal_lm,
     load_text_model,
+    resolve_rope_layout,
     resolve_rotary_emb,
 )
 
@@ -127,6 +128,30 @@ class ResolveRotaryEmbTest(unittest.TestCase):
 
     def test_missing_rope_returns_none(self):
         self.assertIsNone(resolve_rotary_emb(torch.nn.Linear(2, 2)))
+
+
+class ResolveRopeLayoutTest(unittest.TestCase):
+    def test_glm4_is_partial_and_interleaved(self):
+        # GLM-4-9B-0414: head_dim 128, partial_rotary_factor 0.5 -> 只转前 64 维,
+        # 且 rotate_half 是奇偶交错(GPT-NeoX 式)
+        layout = resolve_rope_layout(Glm4Config())
+        self.assertEqual(layout.rotary_dim, 64)
+        self.assertTrue(layout.interleaved)
+
+    def test_default_rope_is_full_and_half_split(self):
+        config = Qwen3Config()
+        layout = resolve_rope_layout(config)
+        head_dim = config.head_dim
+        self.assertEqual(layout.rotary_dim, head_dim)
+        self.assertFalse(layout.interleaved)
+
+    def test_partial_factor_from_top_level_attribute(self):
+        # 旧版实现把 partial_rotary_factor 放在顶层字段: 两处都要探测
+        config = Qwen3Config()
+        config.rope_parameters.pop("partial_rotary_factor", None)
+        config.partial_rotary_factor = 0.5
+        layout = resolve_rope_layout(config)
+        self.assertEqual(layout.rotary_dim, config.head_dim // 2)
 
 
 if __name__ == "__main__":

@@ -716,6 +716,264 @@ class MistralStreamSplitter:
 
 
 # ---------------------------------------------------------------------------
+# GLM-4 工具调用(name\n{json})
+# ---------------------------------------------------------------------------
+
+# GLM-4-0414 的函数调用有两种实测形态:
+#   1) 函数名独占一行, 紧跟一个 JSON 参数对象(输出开头即调用):
+#        'get_weather\n{"city": "北京"}'
+#   2) 函数名前面带一个**字面量角色标记** `<|assistant|>`(模型卡参考实现按
+#      `<|assistant|>` split 以后逐段解析, 就是为这种形态):
+#        '...decision note...<|assistant|>research\n{"query": "...", "source_ids": ["S1"]}'
+# 之后以 <|observation|>(eos)或 <|user|> 结束。没有专用的起始特殊 token, 因此
+# 自动识别看 config.model_type(见 model_adapters._is_glm4_family)。
+GLM4_NAME_PATTERN = r"[A-Za-z_][A-Za-z0-9_.\-]*"
+GLM4_ROLE_MARKER = "<|assistant|>"
+# 两个候选锚点(用命名组区分): 角色标记锚点, 或行首锚点。用 lookahead 让 match.end()
+# 正好落在 '{' 上, 便于 raw_decode 取完整 JSON 对象。
+GLM4_CALL = re.compile(
+    rf"(?m)(?:(?P<role>{re.escape(GLM4_ROLE_MARKER)})[ \t]*|^[ \t]*)"
+    rf"(?P<name>{GLM4_NAME_PATTERN})[ \t]*\r?\n[ \t]*(?=\{{)")
+# 尚未成形的调用尾巴(流式扣留用): 行尾的裸函数名, 可选一个换行, 可选 '{'。
+_GLM4_PARTIAL_TAIL = re.compile(
+    rf"(?m)^[ \t]*(?P<name>{GLM4_NAME_PATTERN})[ \t]*\r?\n?[ \t]*\{{?\Z")
+
+
+def _glm4_candidate_ok(match: re.Match, schemas: Dict[str, Any] | None,
+                       at_output_start: bool) -> bool:
+    """这个 `名字\\n{` 候选是否可信为工具调用(而不是正文里的同形排版).
+
+    三个接受条件, 满足其一即可:
+    - **角色标记锚点**: 名字前面紧跟 `<|assistant|>`(GLM-4 真实输出的形态 2);
+    - **输出开头**: 正文之前没有任何非空白内容(形态 1; 模型直接以调用开头);
+    - **白名单**: 名字在请求声明的工具里(正文中间出现的合法工具调用也不漏)。
+
+    只看"行首标识符 + JSON 对象"会在正文里误判(模型写计划时常见的
+    `Plan\\n{"requirements": [...]}`); 但也不能反过来按白名单硬过滤 —— 那样模型
+    一旦输出未声明的函数名(实测 `research`), 调用会被静默丢掉, 客户端拿不到任何
+    反馈, 主 agent 会一直空转到 turn budget 耗尽。所以: 未声明的名字只有在
+    角色标记/输出开头这两处**协议锚点**上才认。
+    """
+    if schemas and match.group("name") in schemas:
+        return True
+    if match.group("role") is not None:
+        return True
+    return at_output_start
+
+
+
+def _glm4_call(name: str, raw_args: str | None,
+               schema: dict | None = None) -> Dict[str, Any] | None:
+    """(函数名, 参数原始 JSON 子串) -> OpenAI 格式工具调用; 不合法返回 None.
+
+    参数必须是合法 JSON **对象**: GLM 的协议里函数名下一行就是参数对象, 若 JSON
+    畸形(模型没写完)则不当作工具调用 —— 宁可让这段文本留在 content 里, 也不要
+    抛出一个客户端无法执行、且会污染下一轮 prompt 的假调用。arguments 保留模型
+    原始 JSON 子串(round-trip 保真, 模板二次渲染才能与生成流逐位一致)。
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    raw = (raw_args or "").strip() or "{}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if _repair_array_args(data, schema):
+        raw = json.dumps(data, ensure_ascii=False)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:16]}",
+        "type": "function",
+        "function": {"name": name, "arguments": raw},
+    }
+
+
+def parse_glm4_tool_calls(text: str,
+                          schemas: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """扫描可见输出, 提取 GLM-4 的 `name\\n{json}` 工具调用.
+
+    schemas: 函数名 -> parameters schema。既用于 schema 感知的 array 参数修复, 也
+    作为**候选接受条件之一**(见 _glm4_candidate_ok): 名字在请求声明的工具里, 或
+    名字前面紧跟 `<|assistant|>` 角色标记, 或调用出现在输出开头。这样既能容纳
+    GLM-4 真实输出的两种形态, 又不会把正文里"行首单词 + JSON 对象"的排版当成调用。
+    """
+    text = THINK_BLOCK.sub("", text)
+    calls: List[Dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    end = -1  # 已解析对象覆盖到的下标: 跳过其内部的 '{', 避免把嵌套对象当新调用
+    for m in GLM4_CALL.finditer(text):
+        if m.start() <= end:
+            continue
+        if not _glm4_candidate_ok(m, schemas, text[:m.start()].strip() == ""):
+            continue
+        name = m.group("name")
+        brace = m.end()
+        try:
+            obj, n = decoder.raw_decode(text[brace:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        call = _glm4_call(name, text[brace:brace + n], (schemas or {}).get(name))
+        if call is not None:
+            calls.append(call)
+            end = brace + n
+    return calls
+
+
+def clean_glm4_content(text: str) -> str:
+    """去掉 think 块, 返回可进入对话历史的正文.
+
+    GLM-4 没有工具调用专用起始标记, 无法像 hermes 那样"剥掉标记块"; 只有在**真正
+    解析出**工具调用时(parse_model_output 的 content 分支)才切掉调用本体。这里
+    没有解析结果可依据, 因此刻意不删任何 `name\\n{json}` 形态的文本 —— 否则
+    "一行单词 + JSON 对象"的正常回答会被误删成空串(与 llama3_json 的 cleaner 一致,
+    它也只删 <|python_tag|> 前缀与 think 块)。
+    """
+    return THINK_BLOCK.sub("", text).strip()
+
+
+def clean_glm4_prefix(text: str, schemas: Dict[str, Any] | None = None) -> str:
+    """取第一个工具调用之前的正文(**不 strip**, round-trip 保真用).
+
+    必须用与 parse_glm4_tool_calls 相同的接受条件定位起点: 否则正文里被解析器
+    忽略的"行首单词 + JSON"排版会把切口提前。`
+    """
+    text = THINK_BLOCK.sub("", text)
+    for match in GLM4_CALL.finditer(text):
+        if _glm4_candidate_ok(match, schemas, text[:match.start()].strip() == ""):
+            return text[:match.start()]
+    return text
+
+
+class Glm4StreamSplitter:
+    """把逐 token 文本流切成 content / tool_call 事件(GLM-4 name\\n{json} 协议).
+
+    与 hermes/llama/mistral 的流式切分器同一组 push/flush 接口。GLM 的工具调用没有
+    起始特殊 token, 只有两种协议锚点(见 _glm4_candidate_ok): 输出开头的
+    `name\\n{json}`, 或任意位置 `<|assistant|>name\\n{json}`。切分器在缓冲里持续扫描:
+    - 命中完整调用 -> 把锚点之前的文本作为 content 发出, 再发 tool_call;
+    - 命中尚未闭合的调用(锚点已出现但 JSON 没写完)-> 从锚点起扣留, 等后续 chunk;
+    - 都没有 -> 只扣留"可能长成锚点"的尾巴(角色标记前缀/裸标识符), 其余立即发 content。
+
+    流结束时残留缓冲按普通文本返回(与既有各协议一致: 模型没写完就当文本)。
+    """
+
+    def __init__(self, tool_names=None) -> None:
+        self._buf = ""
+        # 已声明的工具名(server 传入): 只用于放宽"正文中间的合法工具调用"这一
+        # 接受条件(见 _glm4_candidate_ok); 未声明的名字靠角色标记/输出开头锚点识别。
+        self._schemas = ({name: None for name in tool_names} if tool_names else None)
+        self._emitted = False     # 是否已吐出过 content(判断"输出开头"用)
+        self._after_call = False  # 上一个事件是 tool_call(连续多个调用时后一个也在锚点上)
+
+    def _emit_content(self, events: List[Tuple[str, Any]], text: str) -> None:
+        if text:
+            self._emitted = True
+            self._after_call = False
+            events.append(("content", text))
+
+    def _scan(self, buf: str):
+        """返回 ('call', start, name, raw, end) / ('pending', start) / None."""
+        decoder = json.JSONDecoder()
+        for match in GLM4_CALL.finditer(buf):
+            at_start = ((not self._emitted and match.start() == 0)
+                        or (self._after_call and buf[:match.start()].strip() == ""))
+            if not _glm4_candidate_ok(match, self._schemas, at_start):
+                continue
+            brace = match.end()
+            try:
+                obj, n = decoder.raw_decode(buf[brace:])
+            except json.JSONDecodeError:
+                return ("pending", match.start())
+            if not isinstance(obj, dict):
+                continue
+            return ("call", match.start(), match.group("name"),
+                    buf[brace:brace + n], brace + n)
+        return None
+
+    def _role_tail_is_call_prefix(self, tail: str) -> bool:
+        """`<|assistant|>` 之后的内容是否还像"正在写的调用"(而不是正文)."""
+        rest = tail.lstrip(" \t")
+        if rest == "":
+            return True
+        match = re.match(GLM4_NAME_PATTERN, rest)
+        if match is None:
+            return False
+        rest = rest[match.end():]
+        if rest.strip(" \t") == "":
+            return True
+        if rest.startswith("\n") or rest.startswith("\r\n"):
+            after = rest.lstrip("\r\n \t")
+            return after == "" or after.startswith("{")
+        return False
+
+    def _holdback(self, buf: str) -> int:
+        """从哪个下标起扣留(尾部可能长成调用锚点); 没有则 len(buf)."""
+        best = len(buf)
+        index = buf.rfind(GLM4_ROLE_MARKER)
+        if index >= 0 and self._role_tail_is_call_prefix(
+                buf[index + len(GLM4_ROLE_MARKER):]):
+            best = min(best, index)
+        # 半截角色标记(如 "<|assist")
+        for k in range(1, len(GLM4_ROLE_MARKER)):
+            if buf.endswith(GLM4_ROLE_MARKER[:k]):
+                best = min(best, len(buf) - k)
+                break
+        # 行尾未成形的 "name" / "name\n" / "name\n{": 输出开头, 白名单工具名,
+        # 或紧跟上一个 tool_call(连续多个调用)时扣留
+        match = _GLM4_PARTIAL_TAIL.search(buf)
+        if match is not None:
+            at_start = ((not self._emitted and match.start() == 0)
+                        or (self._after_call and buf[:match.start()].strip() == ""))
+            known = self._schemas is not None and match.group("name") in self._schemas
+            if at_start or known:
+                best = min(best, match.start())
+        return best
+
+    def push(self, chunk: str) -> List[Tuple[str, Any]]:
+        events: List[Tuple[str, Any]] = []
+        buf = self._buf + chunk
+        while True:
+            found = self._scan(buf)
+            if found is None:
+                hold = self._holdback(buf)
+                if hold > 0:
+                    self._emit_content(events, buf[:hold])
+                    buf = buf[hold:]
+                break
+            if found[0] == "pending":
+                start = found[1]
+                if start > 0:
+                    self._emit_content(events, buf[:start])
+                    buf = buf[start:]
+                break
+            _, start, name, raw, end = found
+            if start > 0:
+                self._emit_content(events, buf[:start])
+            call = _glm4_call(name, raw)
+            if call is not None:
+                events.append(("tool_call", call))
+                self._after_call = True
+            else:
+                # 形态像调用但参数不是合法 JSON 对象: 当正文输出
+                self._emit_content(events, buf[start:end])
+            buf = buf[end:]
+        self._buf = buf
+        return events
+
+    def flush(self) -> List[Tuple[str, Any]]:
+        """流结束收尾: 未闭合的调用/尾部文字按普通文本返回."""
+        events: List[Tuple[str, Any]] = []
+        if self._buf:
+            self._emit_content(events, self._buf)
+        self._buf = ""
+        return events
+
+
+# ---------------------------------------------------------------------------
 # 解析器分派与协议冲突回退(server 用)
 # ---------------------------------------------------------------------------
 
@@ -730,6 +988,8 @@ def parse_output_tool_calls(text: str, parser: str,
         return parse_llama3_json_tool_calls(text, schemas)
     if parser == "mistral":
         return parse_mistral_tool_calls(text, schemas)
+    if parser == "glm4":
+        return parse_glm4_tool_calls(text, schemas)
     return parse_tool_calls(text, schemas)
 
 
@@ -739,29 +999,42 @@ def clean_output_content(text: str, parser: str) -> str:
         return clean_llama3_json_content(text)
     if parser == "mistral":
         return clean_mistral_content(text)
+    if parser == "glm4":
+        return clean_glm4_content(text)
     return clean_content(text)
 
 
-def make_stream_splitter(parser: str):
-    """按解析器名构造流式切分器(server 用)."""
+def make_stream_splitter(parser: str, tool_names=None):
+    """按解析器名构造流式切分器(server 用).
+
+    tool_names: 可用工具名集合, 目前只有 glm4 切分器用(它的协议没有起始标记,
+    需要白名单排除正文里同形的 "一行单词 + JSON 对象"); 其他协议忽略。
+    """
     if parser == "llama3_json":
         return LlamaJsonStreamSplitter()
     if parser == "mistral":
         return MistralStreamSplitter()
+    if parser == "glm4":
+        return Glm4StreamSplitter(tool_names)
     return ToolCallStreamSplitter()
 
 
-# 三种流式切分器都实现同一组 push/flush 接口, 供 server 的类型标注使用
-StreamSplitter = ToolCallStreamSplitter | LlamaJsonStreamSplitter | MistralStreamSplitter
+# 各流式切分器都实现同一组 push/flush 接口, 供 server 的类型标注使用
+StreamSplitter = (ToolCallStreamSplitter | LlamaJsonStreamSplitter
+                  | MistralStreamSplitter | Glm4StreamSplitter)
 
 
-def clean_tool_call_prefix(text: str, parser: str) -> str:
+def clean_tool_call_prefix(text: str, parser: str,
+                           schemas: Dict[str, Any] | None = None) -> str:
     """取第一个工具调用标记之前的正文, 供"有 tool_calls 时也返回 content"使用.
 
     刻意**不 strip**: 客户端把这段正文随 tool_calls 一起回填时模板会原样渲染,
     只有与模型实际生成的 token 逐位一致, 跨请求 KV 前缀才能覆盖整段输出
-    (见 parse_model_output)。
+    (见 parse_model_output)。schemas 只被 glm4 用到: 它没有起始标记, 定位切口
+    必须复用解析器的候选接受条件(见 clean_glm4_prefix)。
     """
+    if parser == "glm4":
+        return clean_glm4_prefix(text, schemas)
     marker = MISTRAL_TOOL_CALLS if parser == "mistral" else TOOL_CALL_START
     pos = text.find(marker)
     return THINK_BLOCK.sub("", text if pos < 0 else text[:pos])
@@ -770,8 +1043,9 @@ def clean_tool_call_prefix(text: str, parser: str) -> str:
 # 有 tool_calls 时仍返回"调用前正文"的协议(与 vLLM 各 parser 一致):
 #   hermes/qwen: content = 第一个 <tool_call> 之前的正文;
 #   mistral    : content = 第一个 [TOOL_CALLS] 之前的正文;
+#   glm4       : content = 第一个 "name\n{json}" 之前的正文;
 #   llama3_json: 返回 null(JSON 调用本身就是整条消息)。
-_KEEP_PREFIX_CONTENT = ("hermes", "qwen", "mistral")
+_KEEP_PREFIX_CONTENT = ("hermes", "qwen", "mistral", "glm4")
 
 
 def parse_model_output(text: str, parser: str, fallback_parser: str | None,
@@ -808,7 +1082,7 @@ def parse_model_output(text: str, parser: str, fallback_parser: str | None,
             calls = fb_calls
         cleaner = fallback_parser
     if calls:
-        content = (clean_tool_call_prefix(text, cleaner)
+        content = (clean_tool_call_prefix(text, cleaner, schemas)
                    if cleaner in _KEEP_PREFIX_CONTENT else "")
     else:
         content = clean_output_content(text, cleaner)

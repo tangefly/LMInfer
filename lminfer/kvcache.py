@@ -55,7 +55,12 @@ from typing import Any
 import torch
 from transformers import DynamicCache
 
-from .model_adapters import TOOL_RESULT_WRAPPERS, resolve_tool_result_wrapper
+from .model_adapters import (
+    TOOL_RESULT_WRAPPERS,
+    ToolResultWrapper,
+    resolve_rope_layout,
+    resolve_tool_result_wrapper,
+)
 
 logger = logging.getLogger("lminfer")
 
@@ -74,6 +79,15 @@ GRAFT_HEAD_SLACK = 2    # 窗口内对齐时允许的首部总漂移 token 数(�
 GRAFT_WINDOW_SLACK = 8  # 包裹标记间窗口长度超出正文长度的容忍上限; 超出说明
                         # 窗口里混入了其他消息(如多段 tool 消息), 锚点不可靠
 GRAFT_MIN_MATCH = 4     # 拼接的最短匹配 token 数(更短可能是误命中, 保守放弃)
+
+
+def _wrapper_label(wrapper: ToolResultWrapper | None) -> str:
+    """拼接模式日志里描述探测到的窗口锚点(显式闭合 / 终止标记集合)."""
+    if wrapper is None:
+        return "未知"
+    if wrapper.close_marker is not None:
+        return f"{wrapper.open_marker}/{wrapper.close_marker}"
+    return f"{wrapper.open_marker}..({'/'.join(wrapper.terminators)})"
 
 
 @dataclass
@@ -165,29 +179,52 @@ def tail_cache(cache: DynamicCache, start: int, config) -> DynamicCache:
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Qwen/Llama/Mistral-style RoPE half rotation."""
+    """Qwen/Llama/Mistral-style half-split RoPE rotation: 配对 (i, i+d/2)."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """GLM/GPT-NeoX-style interleaved RoPE rotation: 配对 (2i, 2i+1).
+
+    与 transformers `Glm4Attention` 里的 `rotate_half` 逐位一致:
+    `stack((-x2, x1), -1).flatten(-2)`, 其中 x1 = x[..., 0::2], x2 = x[..., 1::2]。
+    """
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
 def _plain_delta_cos_sin(length: int, delta: int, head_dim: int, config,
                          device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    """默认 RoPE(rope_type=default)的位置差 cos/sin, 返回 [length, head_dim]."""
+    """默认 RoPE(rope_type=default)的位置差 cos/sin, 返回 [length, rotary_dim].
+
+    按模型自己的布局计算: GLM-4 声明 partial_rotary_factor=0.5, 逆频率只覆盖前
+    64 维, 且 cos/sin 要用 repeat_interleave 展开成奇偶交错。fallback 只在模型
+    完全没有可调用 RoPE 模块时走到, 但布局仍必须一致, 否则相位全错。
+    """
+    layout = resolve_rope_layout(config, head_dim)
+    rotary_dim = layout.rotary_dim
     rope_params = getattr(config, "rope_parameters", None) or {}
     theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000.0))
     inv_freq = 1.0 / (
-        theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+        theta ** (torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32) / rotary_dim)
     )
     positions = torch.full((length,), float(delta), device=device, dtype=torch.float32)
     freqs = torch.outer(positions, inv_freq)
     emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+    cos, sin = emb.cos(), emb.sin()
+    if layout.interleaved:
+        half = cos.shape[-1] // 2
+        cos = cos[..., :half].repeat_interleave(2, dim=-1)
+        sin = sin[..., :half].repeat_interleave(2, dim=-1)
+    return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
 def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
                         device, dtype, rope=None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build cos/sin for a RoPE position delta, shaped [length, head_dim].
+    """Build cos/sin for a RoPE position delta, shaped [length, rotary_dim].
 
     Existing K cache has already been rotated at source positions. Because RoPE
     rotations compose per frequency, rotating by (target_position - source_position)
@@ -201,17 +238,27 @@ def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
     frequencies differ from plain RoPE by 16x). Falling back to the plain formula
     silently rotates grafted K to the wrong phase, so the fallback is only used
     when the model exposes no rotary module at all.
+
+    The returned width is the **rotary_dim** from `resolve_rope_layout`, not the
+    full head_dim: GLM-4 only rotates the first 64 of 128 dims (and interleaves
+    them), so the caller must apply this to `k[..., :rotary_dim]` and keep the
+    rest untouched (mirrors `Glm4Attention.apply_rotary_pos_emb`).
     """
+    layout = resolve_rope_layout(config, head_dim)
     if rope is not None:
         try:
             positions = torch.full((1, length), int(delta), dtype=torch.long, device=device)
             probe = torch.zeros(1, length, 1, device=device, dtype=dtype)
             cos, sin = rope(probe, positions)
             cos, sin = cos[0], sin[0]
-            if cos.shape[-1] == head_dim and sin.shape[-1] == head_dim:
+            if layout.interleaved:  # GLM: rope 返回 cat((freqs,freqs)), apply 侧展开奇偶
+                half = cos.shape[-1] // 2
+                cos = cos[..., :half].repeat_interleave(2, dim=-1)
+                sin = sin[..., :half].repeat_interleave(2, dim=-1)
+            if cos.shape[-1] == layout.rotary_dim and sin.shape[-1] == layout.rotary_dim:
                 return cos.to(dtype=dtype), sin.to(dtype=dtype)
-            logger.warning("RoPE 模块输出形状 %s 与 head_dim %d 不符, "
-                           "回退默认 RoPE 公式", tuple(cos.shape), head_dim)
+            logger.warning("RoPE 模块输出形状 %s 与 rotary_dim %d 不符, "
+                           "回退默认 RoPE 公式", tuple(cos.shape), layout.rotary_dim)
         except Exception as exc:  # noqa: BLE001 - 兜底回退, 不让实验路径直接崩
             logger.warning("调用模型 RoPE 模块失败(%r), 回退默认 RoPE 公式", exc)
     return _plain_delta_cos_sin(length, delta, head_dim, config, device, dtype)
@@ -226,6 +273,11 @@ def rebase_rope_cache(cache: DynamicCache, source_start: int, target_start: int,
     hidden-state gap. `rope` is the model's own rotary-embedding module: passing
     it makes the rebase exact for scaled RoPE variants (e.g. Ministral-3's YaRN),
     see _rope_delta_cos_sin.
+
+    Rotation is applied only to the first `rotary_dim` dims and the layout's own
+    rotate_half is used, so partial/interleaved RoPE (GLM-4: 64 of 128 dims,
+    interleaved pairs) is rebased exactly instead of being mangled by the
+    Qwen/Llama half-split assumption. The non-rotary tail is copied verbatim.
     """
     delta = target_start - source_start
     if delta == 0:
@@ -239,11 +291,20 @@ def rebase_rope_cache(cache: DynamicCache, source_start: int, target_start: int,
         values = layer.values.clone()
         length = keys.shape[-2]
         head_dim = keys.shape[-1]
+        layout = resolve_rope_layout(config, head_dim)
         cos, sin = _rope_delta_cos_sin(length, delta, head_dim, config,
                                        keys.device, keys.dtype, rope)
         cos = cos[None, None, :, :]
         sin = sin[None, None, :, :]
-        keys = (keys * cos) + (_rotate_half(keys) * sin)
+        rotary = layout.rotary_dim
+        if rotary < head_dim:
+            keys_rot, keys_pass = keys[..., :rotary], keys[..., rotary:]
+            rotate = (_rotate_half_interleaved if layout.interleaved else _rotate_half)
+            keys_rot = (keys_rot * cos) + (rotate(keys_rot) * sin)
+            keys = torch.cat([keys_rot, keys_pass], dim=-1)
+        else:
+            rotate = (_rotate_half_interleaved if layout.interleaved else _rotate_half)
+            keys = (keys * cos) + (rotate(keys) * sin)
         layers.append((keys, values))
     return DynamicCache(ddp_cache_data=layers, config=config)
 
@@ -297,25 +358,38 @@ class SessionKVStore:
                        "graft_mismatches": 0}
         # 拼接 cache 时需要模型 config 构造 DynamicCache(server 传入 engine.model_config)
         self._config = config
-        # 拼接模式的结构锚点: chat template 渲染 tool 消息时用一对特殊 token 包裹
-        # 子 agent 输出正文(如 Qwen3 的 <tool_response>、Mistral 的 [TOOL_RESULTS])。
-        # 标记 id 与上下文无关, build_grafts 据此在 prompt 中直接定位正文窗口。
-        # 按 tokenizer 探测实际生效的那一对(见 model_adapters); 探测不到时拼接模式
-        # 自动不可用, 回退 LCP 复用。
+        # 拼接模式的结构锚点: chat template 渲染 tool 消息时用特殊 token 标出
+        # 子 agent 输出正文(Qwen3 的 <tool_response>...</tool_response>、Mistral 的
+        # [TOOL_RESULTS]...[/TOOL_RESULTS]、GLM-4 的 <|observation|> + 下一个角色
+        # 标记)。标记 id 与上下文无关, build_grafts 据此在 prompt 中直接定位正文
+        # 窗口。按 tokenizer 探测实际生效的那组(见 model_adapters); 探测不到时拼接
+        # 模式自动不可用, 回退 LCP 复用。
         self._resp_marker_ids: tuple[int | None, int | None] = (None, None)
-        self._wrapper: tuple[str, str] | None = None
+        self._terminator_ids: tuple[int, ...] = ()
+        self._wrapper: ToolResultWrapper | None = None
         if tokenizer is not None:
             wrapper = resolve_tool_result_wrapper(tokenizer)
             if wrapper is None:
                 logger.warning("tokenizer 没有工具结果包裹标记(%s), 拼接模式"
                                "(--reuse-agent-kv-append)不可用, 回退 LCP 复用",
-                               " / ".join("/".join(p) for p in TOOL_RESULT_WRAPPERS))
+                               " / ".join(w.open_marker for w in TOOL_RESULT_WRAPPERS))
             else:
                 self._wrapper = wrapper
-                self._resp_marker_ids = (tokenizer.convert_tokens_to_ids(wrapper[0]),
-                                         tokenizer.convert_tokens_to_ids(wrapper[1]))
-                logger.info("拼接模式使用工具结果包裹标记: %s/%s (id %s)", *wrapper,
-                            self._resp_marker_ids)
+                close_id = (tokenizer.convert_tokens_to_ids(wrapper.close_marker)
+                            if wrapper.close_marker is not None else None)
+                self._resp_marker_ids = (
+                    tokenizer.convert_tokens_to_ids(wrapper.open_marker), close_id)
+                self._terminator_ids = tuple(
+                    tokenizer.convert_tokens_to_ids(m) for m in wrapper.terminators)
+                if wrapper.close_marker is not None:
+                    logger.info("拼接模式使用工具结果包裹标记: %s/%s (id %s)",
+                                wrapper.open_marker, wrapper.close_marker,
+                                self._resp_marker_ids)
+                else:
+                    logger.info("拼接模式使用工具结果窗口: %s 起, 至下一个角色标记 %s "
+                                "(open id %s, terminator ids %s)",
+                                wrapper.open_marker, list(wrapper.terminators),
+                                self._resp_marker_ids[0], list(self._terminator_ids))
 
     def _prune_idle(self, now: float) -> None:
         """清理闲置超过 idle_ttl 的会话段(会话注册表本身无 TTL, 这里兜底防显存泄漏).
@@ -489,8 +563,10 @@ class SessionKVStore:
         if len(trace) < 2 or trace[-1] != KIND_MAIN or trace[-2] == KIND_MAIN:
             return []
         open_id, close_id = self._resp_marker_ids
-        if open_id is None or close_id is None:
+        if open_id is None:
             return []  # tokenizer 无包裹标记, 拼接模式不可用(见 __init__)
+        if close_id is None and not self._terminator_ids:
+            return []
         segs = self._segments.get(session_id)
         if not segs:
             return []
@@ -507,27 +583,41 @@ class SessionKVStore:
                         if isinstance(main_seg, KVPrefix) else 0)
         windows: list[tuple[int, int, list[int]]] = []
         n = len(prompt_tokens)
+        terminators = set(self._terminator_ids)
         i = search_start
         while i < n:
             if prompt_tokens[i] != open_id:
                 i += 1
                 continue
-            close_pos = -1
-            for j in range(i + 1, n):
-                if prompt_tokens[j] == close_id:
-                    close_pos = j
+            if close_id is not None:
+                # 显式闭合标记(Qwen/Mistral): 找不到就停止扫描
+                close_pos = -1
+                for j in range(i + 1, n):
+                    if prompt_tokens[j] == close_id:
+                        close_pos = j
+                        break
+                if close_pos < 0:
                     break
-            if close_pos < 0:
-                break
-            windows.append((i + 1, close_pos, prompt_tokens[i + 1:close_pos]))
-            i = close_pos + 1
+                windows.append((i + 1, close_pos, prompt_tokens[i + 1:close_pos]))
+                i = close_pos + 1
+            else:
+                # 终止标记集合(GLM-4): 正文延伸到下一个角色标记; 没有就取到末尾
+                close_pos = n
+                for j in range(i + 1, n):
+                    if prompt_tokens[j] in terminators:
+                        close_pos = j
+                        break
+                windows.append((i + 1, close_pos, prompt_tokens[i + 1:close_pos]))
+                # 终止标记本身可能就是下一个 <|observation|>(连续两个工具结果):
+                # 不 +1, 让它在下一轮作为开标记被重新检查
+                i = close_pos
         logger.info("会话 %s: build_grafts trace %s, prompt %d tok, main_lcp %d tok, "
                     "tool_response 窗口 %d 个, 候选 sub 段 %d 个",
                     session_id, trace, n, search_start, len(windows), len(subs))
         if not windows:
-            logger.info("会话 %s: prompt 中未找到 %s/%s 包裹标记, "
+            logger.info("会话 %s: prompt 中未找到 %s 包裹标记, "
                         "放弃拼接(回退 LCP)", session_id,
-                        *(self._wrapper or (TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE)))
+                        _wrapper_label(self._wrapper))
             return []
 
         grafts: list[KVGraft] = []

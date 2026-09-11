@@ -75,6 +75,13 @@ lminfer serve /home/tanger/workspace/models/Ministral-3-8B-Instruct-2512 \
     --repair-window-begin 0.1 --repair-window-end 0.1 \
     --enable-auto-tool-choice --port 8000
 
+# GLM-4 系 / GLM-4-9B-0414(工具调用 name\n{json}, 工具结果角色 observation)
+lminfer serve /home/tanger/workspace/models/GLM-4-9B-0414 \
+    --served-model-name GLM-4-9B-0414 --max-model-len 32768 \
+    --reuse-agent-kv-append --graft-rope-rebase \
+    --repair-window-begin 0.1 --repair-window-end 0.1 \
+    --enable-auto-tool-choice --port 8000
+
 # 也可以不带参数安装直接运行
 python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 ```
@@ -146,8 +153,12 @@ lminfer serve /path/to/model --enable-auto-tool-choice                          
   - Mistral v11+ 系（有 `[TOOL_CALLS]` 特殊 token，如 Ministral-3）走 `mistral`：
     解析输出里的 `[TOOL_CALLS]name[ARGS]{json}`（可多个首尾相接，name 与 `[ARGS]`
     之间可能有 `[CALL_ID]<id>`），对应 vLLM 的 `--tool-call-parser mistral`；
+  - GLM-4 系（`config.model_type == "glm4"`，如 GLM-4-9B-0414）走 `glm4`：解析输出里的
+    `函数名\n{json}`（函数名独占一行、紧跟一个 JSON 参数对象，前面可能带字面量
+    `<|assistant|>`，以 `<|observation|>` / `<|user|>` 结束），对应 vLLM 的
+    `--tool-call-parser glm4`；
   - 都没有则 `none` 关闭解析，输出按普通文本返回。
-  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `mistral` / `none` 强制使用某
+  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `mistral` / `glm4` / `none` 强制使用某
   解析器，但注意 **每个解析器只认自己那套标记**：
   给 Llama 3.x 模型配 `hermes`（或反之）会解析不到任何工具调用，工具调用文本会
   整段漏进 `content`、客户端拿不到 `tool_calls`。为避免这类静默失效，显式配置与
@@ -184,7 +195,7 @@ Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做�
    数组再返回；修复改变了参数时 `arguments` 改用重序列化结果（不再逐位保留）。
    hermes 块解析同样支持该修复；流式路径不做（分片无法整段重写）。
 
-### 模型适配（Qwen / Llama / Mistral / 多模态 / FP8）
+### 模型适配（Qwen / Llama / Mistral / GLM-4 / 多模态 / FP8）
 
 除工具调用协议外，"模型怎么加载、KV 怎么拼"也有家族差异，全部集中在
 `lminfer/model_adapters.py`（加载/协议识别）与 `lminfer/kvcache.py`（KV 拼接）。
@@ -233,6 +244,34 @@ Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做�
 
 完整的适配清单、启动命令与实测日志见
 [Ministral-3 适配记录](docs/ministral3.md)。
+
+**GLM-4 系（GLM-4-9B-0414 实测）**
+
+1. **工具调用**（`glm4` 解析器）：模型输出 `函数名\n{json}` —— 函数名独占一行，紧跟
+   一个 JSON 参数对象，以 `<|observation|>`（本身就是 eos）或 `<|user|>` 结束。
+   函数名前面**可能带字面量 `<|assistant|>`**（实测 research agent 会输出
+   `...decision note...<|assistant|>research\n{"query": ...}`，模型卡参考实现也按
+   `<|assistant|>` split 后逐段解析），解析器对两种形态都识别。没有专用的起始特殊
+   token，所以 `auto` 按 `config.model_type == "glm4"` 识别（不是按 tokenizer 的标记）。
+   `arguments` 保留模型原始 JSON 子串；
+2. **消息协议是 `metadata` + `observation`**：模板写
+   `<|assistant|>{{ metadata }}\n{{ content }}` 与 `<|observation|>\n{{ content }}`，
+   **不认** OpenAI 的 `tool_calls` / `tool` 角色。直接透传会把工具调用渲染成字面量
+   `None`、把工具结果整段丢掉（实测）。服务端 `adapt_glm4_messages` 在渲染前把
+   `tool_calls` 翻译成 `metadata=函数名, content=参数字符串`、把 `tool` 角色翻译成
+   `observation`。这样渲染出的 token 与模型生成流逐位一致，跨请求 KV 前缀能整段命中；
+3. **拼接锚点是 `<|observation|>` 起、到下一个角色标记止**：GLM 的工具结果没有闭合
+   标记，`ToolResultWrapper` 因此支持「终止标记集合」（`<|system|>`/`<|user|>`/
+   `<|assistant|>`/`<|observation|>`）。实测窗口与子输出逐位全中；
+4. **RoPE 是部分旋转 + 奇偶交错**：`partial_rotary_factor: 0.5`（128 维 head 只转前
+   64 维），且 `rotate_half` 是 GPT-NeoX 式的 `(2i, 2i+1)` 配对（cos/sin 用
+   `repeat_interleave(2)` 展开）。`--graft-rope-rebase` 用 `RopeLayout` 按模型布局
+   旋转：实测与「直接在目标位置旋转」相差 4.8e-7；旧的「全 128 维 + 前后对半」写法
+   偏差 > 1.0（K 的量级是 1）；
+5. **一次回复多个工具调用**：模板一条 assistant 消息只带一个 `metadata`，适配层把
+   多个调用拆成多条消息（与模型卡 README 的处理一致）；agent 场景本来就要求一次一个。
+
+完整的适配清单、启动命令与实测日志见 [GLM-4 适配记录](docs/glm4.md)。
 
 ```bash
 # 带 tools 的请求: 模型会输出 <tool_call> 块, 服务端解析为 tool_calls 返回
@@ -390,7 +429,8 @@ lminfer serve /path/to/model --reuse-agent-kv-append
 ```
 
 - **锚点**：包裹标记由 tokenizer 探测得到（Qwen3 是 `<tool_response>`，Mistral 是
-  `[TOOL_RESULTS]`，见 `TOOL_RESULT_WRAPPERS`），两端都必须是单个特殊 token；
+  `[TOOL_RESULTS]`，GLM-4 是 `<|observation|>` + 下一个角色标记，见
+  `TOOL_RESULT_WRAPPERS`），标记都必须是单个特殊 token；
   探测不到时拼接模式自动不可用（启动日志会说明），退化为 LCP 复用。子输出是
   "本轮新内容"，搜索起点取最新 main 段长度，历史里与子输出相似的文本（如任务
   原文）直接被排除；

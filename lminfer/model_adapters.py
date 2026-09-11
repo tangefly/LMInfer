@@ -11,10 +11,17 @@ LMInfer 只依赖 transformers 的高层 API, 但不同模型家族在工具调�
 - Mistral 系(Ministral 3 / Mistral-Small 等 v11+ tokenizer): 模型输出
   `[TOOL_CALLS]name[ARGS]{json}`(可选 `[CALL_ID]<id>`), 解析器是 mistral;
   模板用 `[TOOL_RESULTS]...[/TOOL_RESULTS]` 包裹工具结果, 且由 mistral-common
-  而不是 jinja 渲染(见 supports_chat_template).
+  而不是 jinja 渲染(见 supports_chat_template);
+- GLM-4 系(GLM-4-9B-0414 等): 模型输出 `name\n{json}`(函数名独占一行, 紧跟一个
+  JSON 参数对象; 函数名前**可能带字面量 `<|assistant|>`**, 以 `<|observation|>`/
+  `<|user|>` 结束), 解析器是 glm4; 消息协议用 assistant 的 `metadata` 字段承载
+  函数名、content 承载参数 JSON, 工具结果用 `observation` 角色 —— 该 jinja 模板
+  **不认** OpenAI 的 `tool` 角色与 `tool_calls` 字段, 直接透传会把工具调用整段
+  丢掉(见 ModelProfile.tool_protocol)。
 
-`--tool-call-parser` 的默认值 auto 在这里解析成具体解析器(依据 tokenizer 的
-特殊 token 自动识别), 显式指定(hermes/qwen/llama3_json/mistral/none)则原样使用.
+`--tool-call-parser` 的默认值 auto 在这里解析成具体解析器(依据 config 的
+model_type 或 tokenizer 的特殊 token 自动识别), 显式指定
+(hermes/qwen/llama3_json/mistral/glm4/none)则原样使用.
 显式指定与模型家族协议冲突时(如 Llama 3.x 模型配 hermes), 启动时告警,
 请求时先按显式配置解析、失败再按模型原生协议回退解析(见 ModelProfile).
 
@@ -35,13 +42,43 @@ TOOL_RESPONSE_CLOSE = "</tool_response>"
 MISTRAL_TOOL_CALLS = "[TOOL_CALLS]"  # Mistral v11+ 工具调用起始特殊 token
 MISTRAL_TOOL_RESULTS = "[TOOL_RESULTS]"
 MISTRAL_TOOL_RESULTS_END = "[/TOOL_RESULTS]"
+# GLM-4 系的工具结果角色标记: 模板把工具结果渲染成 `<|observation|>\n正文`,
+# 正文后面紧跟下一个角色标记(通常是 add_generation_prompt 的 `<|assistant|>`)。
+GLM_OBSERVATION = "<|observation|>"
+GLM_ROLE_MARKERS = ("<|system|>", "<|user|>", "<|assistant|>", GLM_OBSERVATION)
+# GLM-4 系(config.model_type): GLM-4-0414 这类 dense 模型的工具调用走 name\n{json}
+# 文本协议, RoPE 是部分旋转 + 奇偶交错。刻意只列 "glm4": GLM-4.5/MoE(glm4_moe)
+# 用的是 <tool_call><arg_key>... 的 XML 协议, 不能共用这套识别。
+GLM4_MODEL_TYPES = ("glm4",)
+
+
+@dataclass(frozen=True)
+class ToolResultWrapper:
+    """chat template 渲染工具结果时用的结构锚点(拼接模式定位子 agent 输出正文).
+
+    两种形态:
+    - **显式闭合标记**(Qwen 的 `<tool_response>`/`</tool_response>`、Mistral 的
+      `[TOOL_RESULTS]`/`[/TOOL_RESULTS]`): 正文位于一对特殊 token 之间;
+    - **终止标记集合**(GLM-4): 模板只写 `<|observation|>\n{{ content }}`, 没有
+      闭合标记, 正文一直延伸到下一个角色标记(`<|user|>` / `<|assistant|>` /
+      `<|system|>` / 下一个 `<|observation|>`)。
+
+    两端的标记都必须是**单个特殊 token**(id 与上下文无关), 拼接模式才能直接按
+    id 定位窗口。
+    """
+
+    open_marker: str
+    close_marker: str | None = None
+    terminators: tuple[str, ...] = ()
+
 
 # 工具结果包裹标记候选: 拼接模式(--reuse-agent-kv-append)据此在渲染后的 prompt 中
 # 定位子 agent 输出正文的窗口。按模型家族协议探测, 取 tokenizer 里真实存在的
 # 单 token 特殊标记(见 resolve_tool_result_wrapper)。
 TOOL_RESULT_WRAPPERS = (
-    (TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE),        # Qwen/Hermes
-    (MISTRAL_TOOL_RESULTS, MISTRAL_TOOL_RESULTS_END),  # Mistral
+    ToolResultWrapper(TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE),        # Qwen/Hermes
+    ToolResultWrapper(MISTRAL_TOOL_RESULTS, MISTRAL_TOOL_RESULTS_END),  # Mistral
+    ToolResultWrapper(GLM_OBSERVATION, terminators=GLM_ROLE_MARKERS),   # GLM-4
 )
 
 # Mistral 的 tool_call id 必须满足 mistral-common 的校验(a-z/A-Z/0-9, 长度 9),
@@ -54,7 +91,8 @@ FP8_KERNEL_NAME = "kernels"  # fine-grained FP8 前向所需的 Triton 内核包
 class ModelProfile:
     """一次服务启动解析出的模型适配参数."""
 
-    tool_parser: str  # "hermes" | "llama3_json" | "none": 实际生效的工具调用解析器
+    tool_parser: str  # "hermes" | "llama3_json" | "mistral" | "glm4" | "none":
+                      # 实际生效的工具调用解析器
     native_parser: str  # 模型家族原生协议解析器(auto 的识别结果), 冲突回退用
     arguments_as_dict: bool  # True: 模板把 OpenAI arguments(JSON 字符串)当对象渲染。
                              # Llama 3.x 模板写 `tool_call.arguments | tojson`,
@@ -63,6 +101,10 @@ class ModelProfile:
     wrap_tool_output: bool   # True: 工具结果(content 字符串)渲染成 {"output": ...}。
                              # Llama 3.x 模板的 ipython 块对字符串直接 | tojson 会加引号,
                              # 包成对象后与模型训练时的工具结果格式一致;
+    tool_protocol: str = "openai"  # "openai": OpenAI 的 tool_calls/tool 消息原样渲染
+                                   # (模板自己认识这两个字段); "glm4": GLM-4 模板只认
+                                   # assistant.metadata 与 observation 角色, 渲染前必须
+                                   # 把 OpenAI 消息翻译成原生形态(见 server._message_dicts)
 
     @property
     def fallback_parser(self) -> str | None:
@@ -89,16 +131,31 @@ def _has_special_token(tokenizer, token: str) -> bool:
             and tokenizer.convert_ids_to_tokens(tid) == token)
 
 
-def resolve_tool_parser(configured: str, tokenizer) -> str:
-    """把配置值解析成具体解析器: auto 依据 tokenizer 特殊 token 自动识别.
+def _is_glm4_family(model_config, tokenizer) -> bool:
+    """是否 GLM-4 系(工具调用走 `name\\n{json}` 文本协议).
+
+    优先看 config.model_type(权威): glm4 是 GLM-4-0414 这类 dense 模型的
+    model_type。只有在拿不到 config 时(单元测试的桩 / 未传 model_config)才退化到
+    tokenizer 的特殊 token 探测 —— `<|observation|>` 是 GLM chat 系独有的角色标记。
+    """
+    model_type = (str(getattr(model_config, "model_type", "") or "")
+                  if model_config is not None else "")
+    if model_type:
+        return model_type.lower() in GLM4_MODEL_TYPES
+    return _has_special_token(tokenizer, GLM_OBSERVATION)
+
+
+def resolve_tool_parser(configured: str, tokenizer, model_config=None) -> str:
+    """把配置值解析成具体解析器: auto 依据 config/tokenizer 自动识别.
 
     - 有 `<tool_call>` 特殊 token(Qwen/Hermes 系) -> hermes 风格块解析;
     - 有 `<|python_tag|>` 特殊 token(Llama 3.x 系) -> llama3_json 风格 JSON 解析;
     - 有 `[TOOL_CALLS]` 特殊 token(Mistral v11+ 系) -> mistral 风格解析;
+    - config.model_type 是 glm4(GLM-4 系) -> glm4 的 `name\\n{json}` 解析;
     - 都没有 -> none(关闭工具解析, 按普通文本返回).
-    显式指定的 hermes/qwen/llama3_json/mistral/none 原样使用.
+    显式指定的 hermes/qwen/llama3_json/mistral/glm4/none 原样使用.
     """
-    if configured in ("hermes", "qwen", "llama3_json", "mistral", "none"):
+    if configured in ("hermes", "qwen", "llama3_json", "mistral", "glm4", "none"):
         return configured
     if _has_special_token(tokenizer, TOOL_CALL_START):
         return "hermes"
@@ -106,20 +163,30 @@ def resolve_tool_parser(configured: str, tokenizer) -> str:
         return "llama3_json"
     if _has_special_token(tokenizer, MISTRAL_TOOL_CALLS):
         return "mistral"
+    if _is_glm4_family(model_config, tokenizer):
+        return "glm4"
     return "none"
 
 
-def resolve_tool_result_wrapper(tokenizer) -> tuple[str, str] | None:
-    """探测该 tokenizer 用哪一对标记包裹工具结果(拼接模式定位正文用).
+def _wrapper_is_usable(tokenizer, wrapper: ToolResultWrapper) -> bool:
+    """包裹标记(以及终止标记集合)是否都由单个特殊 token 组成."""
+    markers = [wrapper.open_marker]
+    if wrapper.close_marker is not None:
+        markers.append(wrapper.close_marker)
+    markers.extend(wrapper.terminators)
+    return all(_has_special_token(tokenizer, m) for m in markers)
 
-    两端的标记都必须是**单个特殊 token**(id 与上下文无关), 拼接模式才能在渲染后的
+
+def resolve_tool_result_wrapper(tokenizer) -> ToolResultWrapper | None:
+    """探测该 tokenizer 用哪组标记包裹工具结果(拼接模式定位正文用).
+
+    标记都必须是**单个特殊 token**(id 与上下文无关), 拼接模式才能在渲染后的
     prompt 里直接按 id 定位窗口。都探测不到时返回 None, 拼接模式自动不可用, 由
     SessionKVStore 回退 LCP 复用(见 kvcache.py)。
     """
-    for open_marker, close_marker in TOOL_RESULT_WRAPPERS:
-        if (_has_special_token(tokenizer, open_marker)
-                and _has_special_token(tokenizer, close_marker)):
-            return open_marker, close_marker
+    for wrapper in TOOL_RESULT_WRAPPERS:
+        if _wrapper_is_usable(tokenizer, wrapper):
+            return wrapper
     return None
 
 
@@ -139,8 +206,8 @@ def supports_chat_template(tokenizer) -> bool:
 def resolve_model_profile(configured_parser: str, tokenizer,
                           model_config=None) -> ModelProfile:
     """解析出本次服务实际使用的模型适配参数(见 ModelProfile)."""
-    parser = resolve_tool_parser(configured_parser, tokenizer)
-    native = resolve_tool_parser("auto", tokenizer)
+    parser = resolve_tool_parser(configured_parser, tokenizer, model_config)
+    native = resolve_tool_parser("auto", tokenizer, model_config)
     if parser != native and native != "none" and parser != "none":
         # 显式解析器与模型家族协议冲突: 解析器对模型输出永远解析不出结果,
         # 工具调用会整段漏进 content, 客户端拿不到 tool_calls(只会看到原始
@@ -157,7 +224,57 @@ def resolve_model_profile(configured_parser: str, tokenizer,
         native_parser=native,
         arguments_as_dict=llama3,
         wrap_tool_output=llama3,
+        # 工具消息的**渲染**协议由模型家族决定(与配置的解析器无关): GLM-4 的
+        # jinja 模板只认 assistant.metadata / observation, 不认 OpenAI 的
+        # tool_calls / tool 角色 —— 必须按原生形态翻译, 否则工具调用整段丢失.
+        tool_protocol="glm4" if native == "glm4" else "openai",
     )
+
+
+# ---------------------------------------------------------------------------
+# 模型家族知识: RoPE 布局(拼接模式的 K 位置重映射用)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RopeLayout:
+    """文本解码器 RoPE 的旋转布局(位置差 rotation 必须与模型前向逐位一致).
+
+    - rotary_dim : 实际参与旋转的维度数(<= head_dim)。GLM-4 声明
+      `partial_rotary_factor: 0.5`, 即 128 维 head 只有前 64 维旋转, 后 64 维
+      原样透传(`apply_rotary_pos_emb` 里 q_pass/k_pass);
+    - interleaved: rotate_half 的配对方式。False = Qwen/Llama/Mistral 的
+      "前后对半"(`cat((-x2, x1))`, 配对 (i, i+d/2)); True = GLM/GPT-NeoX 的
+      "奇偶交错"(`stack((-x2, x1), -1).flatten()`, 配对 (2i, 2i+1)), 且 cos/sin
+      要用 `repeat_interleave(2)` 展开。
+    """
+
+    rotary_dim: int
+    interleaved: bool = False
+
+
+def resolve_rope_layout(config, head_dim: int | None = None) -> RopeLayout:
+    """从文本 config 解析 RoPE 旋转布局.
+
+    `partial_rotary_factor` 出现在 config.rope_parameters(GLM-4-0414 实测)或
+    顶层字段(旧版 Llama 实现), 两处都探测。交错式 rotate_half 由模型家族决定,
+    无法从 rope 模块的返回值区分(它们都返回 `cat((freqs, freqs))`, 差别只在
+    attention 里的 apply), 因此按 model_type 判定。
+    """
+    if head_dim is None:
+        head_dim = (getattr(config, "head_dim", None)
+                    or config.hidden_size // config.num_attention_heads)
+    params = getattr(config, "rope_parameters", None) or {}
+    factor = params.get("partial_rotary_factor")
+    if factor is None:
+        factor = getattr(config, "partial_rotary_factor", 1.0)
+    try:
+        factor = float(factor)
+    except (TypeError, ValueError):
+        factor = 1.0
+    rotary_dim = max(1, min(int(head_dim * factor), head_dim))
+    model_type = (str(getattr(config, "model_type", "") or "") if config is not None else "")
+    return RopeLayout(rotary_dim=rotary_dim,
+                      interleaved=model_type.lower() in GLM4_MODEL_TYPES)
 
 
 # ---------------------------------------------------------------------------

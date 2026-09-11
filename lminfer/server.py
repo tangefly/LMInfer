@@ -41,6 +41,47 @@ STREAM_HEADERS = {
 }
 
 
+def adapt_glm4_messages(messages: list, strip_assistant_think: bool = True) -> list[dict]:
+    """OpenAI 消息 -> GLM-4 原生消息(assistant.metadata + observation).
+
+    GLM-4-0414 的 jinja 模板不认 OpenAI 的 tool_calls / tool 角色: 直接透传会把工具
+    调用渲染成字面量 `None`、工具结果整段丢弃(实测), agent 多轮直接失效。这里翻译
+    成模板真正认识的原生形态:
+    - assistant + tool_calls -> "metadata=函数名, content=参数 JSON" 的 assistant
+      消息(多个调用拆成多条; 有调用前正文时正文单独成一条);
+    - tool 角色 -> observation 角色(tool_call_id 模板不认, 丢弃)。
+
+    这样渲染出的 `<|assistant|>name\\n{json}<|observation|>...` 与模型自己生成并以
+    `<|observation|>` 结束的工具调用**逐位一致**, 跨请求 KV 前缀复用能整段命中
+    (见 toolcalls.parse_glm4_tool_calls 的 arguments 保真)。
+
+    模块级纯函数(不依赖 app 闭包), 便于用真实 tokenizer 做渲染回归测试。
+    """
+    out: list[dict] = []
+    for m in messages:
+        role = getattr(m, "role", None)
+        content = getattr(m, "content", None)
+        tool_calls = getattr(m, "tool_calls", None)
+        if strip_assistant_think and role == "assistant" and isinstance(content, str):
+            content = THINK_BLOCK.sub("", content)
+        if role == "tool":
+            out.append({"role": "observation", "content": content})
+            continue
+        if role == "assistant" and tool_calls:
+            if isinstance(content, str) and content.strip():
+                out.append({"role": "assistant", "content": content})
+            for call in tool_calls:
+                fn = (call or {}).get("function") or {}
+                args = fn.get("arguments")
+                if not isinstance(args, str):
+                    args = json.dumps(args if args is not None else {}, ensure_ascii=False)
+                out.append({"role": "assistant", "metadata": fn.get("name") or "",
+                            "content": args})
+            continue
+        out.append({"role": role, "content": content})
+    return out
+
+
 def create_app(engine: LLMEngine) -> FastAPI:
     """把引擎包装成 FastAPI 应用."""
 
@@ -175,7 +216,12 @@ def create_app(engine: LLMEngine) -> FastAPI:
         "parameters": "{\"city\": ...}"(字符串被加引号), 工具结果 content 字符串
         也会被加引号 —— 渲染前把 arguments 还原成 dict、工具结果包成 {"output": ...}
         对象, 才能得到模型训练时见到的合法 JSON(与 vLLM 的 llama3.1_json 模板一致).
+
+        GLM-4 适配(profile.tool_protocol == "glm4"): 模板只认 assistant.metadata
+        与 observation 角色, 走 adapt_glm4_messages 翻译(见该模块级函数)。
         """
+        if profile.tool_protocol == "glm4":
+            return adapt_glm4_messages(messages, strip_assistant_think)
         out = []
         for m in messages:
             content = m.content
@@ -437,12 +483,22 @@ def create_app(engine: LLMEngine) -> FastAPI:
         # Capture before the inference thread consumes the request-owned lists.
         attempted = bool(reuse_prefixes) or bool(graft)
         reuse_options = {"consume_reuse": True} if consume_reuse else {}
+        # 请求的工具 schema: 函数名 -> parameters。收录**全部**工具名(parameters
+        # 可以为空) —— glm4 解析器(非流式与流式)用它当白名单, 排除"正文里一行单词 +
+        # 一个 JSON 对象"的误判(见 parse_glm4_tool_calls / Glm4StreamSplitter)。
+        schemas = {} if not parse_tools else {
+            t["function"]["name"]: t["function"].get("parameters")
+            for t in (tools or [])
+            if isinstance(t.get("function"), dict)
+            and isinstance(t["function"].get("name"), str)
+        }
 
         if req.stream:
             # 配置解析器与模型协议冲突时直接按原生协议切流: 显式配置的解析器
             # 对该模型的输出永远不匹配, 保留它只会让工具调用整段漏进 content
             stream_parser = profile.fallback_parser or profile.tool_parser
-            splitter = make_stream_splitter(stream_parser) if parse_tools else None
+            splitter = (make_stream_splitter(stream_parser, schemas)
+                        if parse_tools else None)
             queue = await engine.generate(req_id, prompt_ids, sampling, stream=True,
                                           skip_special_tokens=not parse_tools,
                                           reuse_prefixes=reuse_prefixes,
@@ -472,13 +528,8 @@ def create_app(engine: LLMEngine) -> FastAPI:
             # 原生协议再解析一次, 工具调用不会静默丢失. 有 tool_calls 时
             # content 为 null(vLLM 语义), 无 tool_calls 时返回清理后的文本.
             # 请求的工具 schema 用于修复模型格式滑移(如 Llama 把 array 参数
-            # 写成字符串形式的列表 "['S1']", 客户端会按 schema 拒绝执行)
-            schemas = {
-                t["function"]["name"]: t["function"].get("parameters")
-                for t in (tools or [])
-                if isinstance(t.get("function"), dict)
-                and isinstance(t["function"].get("parameters"), dict)
-            }
+            # 写成字符串形式的列表 "['S1']", 客户端会按 schema 拒绝执行);
+            # 本轮请求开始时已按 parse_tools 建好(见上文 schemas)。
             tool_calls, content = parse_model_output(
                 r.output_text, profile.tool_parser, profile.fallback_parser,
                 req_id, schemas)
