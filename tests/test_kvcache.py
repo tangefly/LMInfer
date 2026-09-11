@@ -9,6 +9,7 @@ from lminfer.kvcache import (
     TOOL_RESPONSE_CLOSE,
     TOOL_RESPONSE_OPEN,
     SessionKVStore,
+    rebase_rope_cache,
 )
 
 
@@ -253,6 +254,195 @@ class SessionKVStoreTest(unittest.TestCase):
         self.assertIsNotNone(graft)
         self.assertEqual(graft.tokens, [31, 32, 33, 34])
         self.assertEqual(graft.position, 8)
+
+
+class MistralFakeTokenizer:
+    """Ministral 式的 tokenizer: 工具结果用 [TOOL_RESULTS] 包裹."""
+
+    ids = {"[TOOL_RESULTS]": 7, "[/TOOL_RESULTS]": 8}
+
+    def convert_tokens_to_ids(self, token):
+        return self.ids.get(token, -1)
+
+    def convert_ids_to_tokens(self, token_id):
+        for token, tid in self.ids.items():
+            if tid == token_id:
+                return token
+        return f"tok_{token_id}"
+
+
+class NoWrapperFakeTokenizer:
+    """既没有 <tool_response> 也没有 [TOOL_RESULTS]: 拼接模式应自动禁用."""
+
+    def convert_tokens_to_ids(self, token):
+        return -1
+
+    def convert_ids_to_tokens(self, token_id):
+        return f"tok_{token_id}"
+
+
+class GraftWrapperTest(unittest.TestCase):
+    def test_mistral_tool_results_window_is_grafted(self):
+        store = SessionKVStore(config=None, tokenizer=MistralFakeTokenizer())
+        main_tokens = [1, 2, 3]
+        self.assertTrue(store.put("s", KIND_MAIN, main_tokens, make_cache(3), prompt_len=3))
+        sub_out = [101, 102, 103, 104]
+        self.assertTrue(store.put("s", KIND_SUB, [9] + sub_out, make_cache(5), prompt_len=1))
+
+        prompt = main_tokens + [7] + sub_out + [8]
+        grafts = store.build_grafts("s", [KIND_MAIN, "sub", KIND_MAIN], prompt)
+
+        self.assertEqual([g.tokens for g in grafts], [sub_out])
+        self.assertEqual([g.position for g in grafts], [4])
+        self.assertEqual([g.source_position for g in grafts], [1])
+
+    def test_unknown_wrapper_disables_append_mode(self):
+        store = SessionKVStore(config=None, tokenizer=NoWrapperFakeTokenizer())
+        self.assertTrue(store.put("s", KIND_MAIN, [1], make_cache(1), prompt_len=1))
+        self.assertTrue(store.put("s", KIND_SUB, [9, 101, 102, 103, 104], make_cache(5), prompt_len=1))
+        prompt = [1, 7, 101, 102, 103, 104, 8]
+        self.assertEqual(store.build_grafts("s", [KIND_MAIN, "sub", KIND_MAIN], prompt), [])
+        # LCP 复用不受影响, 仍然给出候选段
+        self.assertEqual(len(store.propose("s", [KIND_MAIN])), 2)
+
+
+class _SinusoidalRope(torch.nn.Module):
+    """最小 RoPE 模块: 形状/约定与 transformers 的 RotaryEmbedding 一致."""
+
+    def __init__(self, inv_freq):
+        super().__init__()
+        self.register_buffer("inv_freq", torch.as_tensor(inv_freq, dtype=torch.float32))
+
+    def forward(self, x, position_ids):
+        positions = position_ids.reshape(-1).float()
+        freqs = torch.outer(positions, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(x.dtype)[None], emb.sin().to(x.dtype)[None]
+
+
+def _rotate(x, cos, sin):
+    """half-split RoPE 旋转(与 Qwen/Llama/Mistral 的 apply_rotary_pos_emb 一致)."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return x * cos + rotated * sin
+
+
+class RopeRebaseTest(unittest.TestCase):
+    def setUp(self):
+        self.head_dim = 8
+        self.length = 4
+        self.source, self.target = 20, 35
+        torch.manual_seed(0)
+        self.keys = torch.randn(1, 1, self.length, self.head_dim)
+        self.values = torch.randn(1, 1, self.length, self.head_dim)
+        # 默认 RoPE 的逆频率(测试里显式写出来, 不依赖被测代码)
+        self.inv_freq = 1.0 / (10000.0 ** (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
+
+    def _cache_with_keys(self, keys):
+        return DynamicCache(ddp_cache_data=[(keys.clone(), self.values.clone())], config=None)
+
+    def test_rebase_composes_rope_positions(self):
+        # 子段 KV 是在 source 位置旋转过的; rebase 到 target 后应与"直接在 target
+        # 位置旋转"逐元素一致(位置差旋转与位置旋转复合)
+        rope = _SinusoidalRope(self.inv_freq)
+        source_cos, source_sin = rope(self.keys, torch.full((1, self.length), self.source))
+        at_source = _rotate(self.keys, source_cos, source_sin)
+        at_target = _rotate(self.keys, *rope(self.keys, torch.full((1, self.length), self.target)))
+
+        rebased = rebase_rope_cache(self._cache_with_keys(at_source), self.source,
+                                    self.target, None, rope=rope)
+
+        torch.testing.assert_close(rebased.layers[0].keys, at_target,
+                                   atol=1e-6, rtol=1e-6)
+        # V 不参与 RoPE, 原样深拷贝
+        torch.testing.assert_close(rebased.layers[0].values, self.values)
+
+    def test_rebase_uses_model_rope_not_plain_theta(self):
+        # 缩放型 RoPE(YaRN/Llama-3)的逆频率与默认 theta 公式不同: 传了模型 RoPE
+        # 就必须用它, 否则位置重映射会转到错误的相位(Ministral-3 是 YaRN factor 16)
+        scaled = self.inv_freq / 16.0
+        rope = _SinusoidalRope(scaled)
+        source_cos, source_sin = rope(self.keys, torch.full((1, self.length), self.source))
+        cache = self._cache_with_keys(_rotate(self.keys, source_cos, source_sin))
+
+        with_rope = rebase_rope_cache(cache, self.source, self.target, None, rope=rope)
+        without = rebase_rope_cache(cache, self.source, self.target, None)
+
+        expected = _rotate(self.keys, *rope(self.keys, torch.full((1, self.length), self.target)))
+        torch.testing.assert_close(with_rope.layers[0].keys, expected, atol=1e-6, rtol=1e-6)
+        self.assertFalse(torch.allclose(with_rope.layers[0].keys, without.layers[0].keys))
+
+    def test_rebase_falls_back_when_rope_shape_is_unusable(self):
+        class WrongShape(torch.nn.Module):
+            def forward(self, x, position_ids):
+                return torch.ones(1, 3, 4), torch.zeros(1, 3, 4)
+
+        cache = self._cache_with_keys(self.keys)
+        rebased = rebase_rope_cache(cache, self.source, self.target, None,
+                                    rope=WrongShape())
+        expected = rebase_rope_cache(cache, self.source, self.target, None)
+        torch.testing.assert_close(rebased.layers[0].keys, expected.layers[0].keys)
+
+
+class Ministral3YarnRebaseTest(unittest.TestCase):
+    """用模型真实的 YaRN RoPE 模块验证 rebase 相位(Ministral-3, 不需要权重).
+
+    Ministral-3 的 text_config 声明 rope_type=yarn(factor 16): 低频频段的逆频率
+    与默认 theta 公式相差 16 倍。默认公式会把拼接进来的 K 转到错误相位 —— 这个
+    用例就是那次适配的回归测试。
+    """
+
+    SOURCE, TARGET, LENGTH, HEAD_DIM = 1200, 2400, 6, 128
+
+    @staticmethod
+    def _rope():
+        from transformers import Ministral3Config
+        from transformers.models.ministral3.modeling_ministral3 import (
+            Ministral3RotaryEmbedding,
+        )
+        config = Ministral3Config(hidden_size=4096, num_attention_heads=32,
+                                  num_key_value_heads=8, num_hidden_layers=2,
+                                  head_dim=128)
+        config.rope_parameters = {
+            "beta_fast": 32.0, "beta_slow": 1.0, "factor": 16.0,
+            "llama_4_scaling_beta": 0.1, "mscale": 1.0, "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 16384, "rope_theta": 1000000.0,
+            "rope_type": "yarn", "type": "yarn",
+        }
+        return Ministral3RotaryEmbedding(config)
+
+    def _keys_at(self, rope, keys, position):
+        positions = torch.full((1, keys.shape[-2]), position)
+        return _rotate(keys, *rope(keys, positions))
+
+    def test_rebase_matches_model_rope_at_target_position(self):
+        rope = self._rope()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+        at_target = self._keys_at(rope, keys, self.TARGET)
+        cache = DynamicCache(ddp_cache_data=[(at_source, at_source.clone())], config=None)
+
+        rebased = rebase_rope_cache(cache, self.SOURCE, self.TARGET, None, rope=rope)
+
+        torch.testing.assert_close(rebased.layers[0].keys, at_target,
+                                   atol=1e-5, rtol=1e-5)
+
+    def test_plain_theta_formula_rotates_to_the_wrong_phase(self):
+        rope = self._rope()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+        at_target = self._keys_at(rope, keys, self.TARGET)
+        cache = DynamicCache(ddp_cache_data=[(at_source, at_source.clone())], config=None)
+
+        without_rope = rebase_rope_cache(cache, self.SOURCE, self.TARGET, None)
+
+        # 相位错误不是舍入误差量级: 与正确答案相差 K 自身的量级
+        error = (without_rope.layers[0].keys - at_target).abs().max()
+        self.assertGreater(float(error), 1.0)
 
 
 if __name__ == "__main__":

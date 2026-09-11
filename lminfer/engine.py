@@ -16,6 +16,7 @@
 
 import asyncio
 import functools
+import inspect
 import logging
 import time
 import uuid
@@ -25,7 +26,6 @@ from typing import Callable
 
 import torch
 from transformers import (
-    AutoModelForCausalLM,
     AutoTokenizer,
     DynamicCache,
     LogitsProcessorList,
@@ -36,6 +36,7 @@ from transformers import (
 )
 
 from .config import EngineConfig, SamplingParams
+from .model_adapters import load_text_model, resolve_rotary_emb
 from .repair import repair_token_counts
 from .context_repair import context_prefill, exact_prefill
 from .kvcache import (
@@ -120,23 +121,47 @@ class LLMEngine:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # <think>/</think> 特殊 token id(拼接模式剔除 think KV 用);
-        # 模型没有这两个 token 时置 None, think 检测自动禁用
+        # 模型没有这两个 token 时置 None, think 检测自动禁用。
+        # 必须校验 id 能反查回同名 token: 词表里没有时 convert_tokens_to_ids 会
+        # 返回 unk id, 只判 >=0 会把 <unk> 当成 think 标记(Ministral 等无 think
+        # 模型的输出首个 token 恰好是 <unk> 时会误判)。
         ids = self.tokenizer.convert_tokens_to_ids([THINK_START, THINK_END])
         self._think_ids = (ids[0], ids[1]) if all(
-            isinstance(i, int) and i >= 0 for i in ids) else None
+            isinstance(i, int) and i >= 0
+            and self.tokenizer.convert_ids_to_tokens(i) == t
+            for i, t in zip(ids, (THINK_START, THINK_END))) else None
 
         # attn_implementation: "auto" 传 None, 让 transformers 用默认(sdpa);
         # 显式指定(如 flash_attention_2)则透传, 未安装 flash-attn 时由 transformers 回退 kernels 或报错
         attn_impl = None if self.config.attn_implementation == "auto" else self.config.attn_implementation
-        self.model = AutoModelForCausalLM.from_pretrained(
+        # 模型加载的家族差异(多模态包装 / fine-grained FP8)交给适配层(见 model_adapters.py)
+        self.model, text_config, notes = load_text_model(
             self.config.model,
-            torch_dtype=dtype_map[self.config.dtype],
+            dtype=dtype_map[self.config.dtype],
             device_map=self.config.device_map,
             trust_remote_code=self.config.trust_remote_code,
             attn_implementation=attn_impl,
+            dequantize_fp8=self.config.dequantize_fp8,
         )
+        for note in notes:
+            logger.info("模型适配: %s", note)
         self.model.eval()
         self.model.requires_grad_(False)
+        # KV 形状/位置/RoPE 计算一律基于**文本塔** config(见 model_config 属性)
+        self._model_config = text_config
+        # 文本解码器的 RoPE 模块: 拼接模式的 K 位置重映射必须用模型自己的逆频率
+        # (Ministral-3 是 YaRN, 与默认 theta 公式不同; 见 kvcache._rope_delta_cos_sin)
+        self._rotary_emb = resolve_rotary_emb(self.model)
+        # transformers 5.x 的 CausalLM 可以只要最后一个位置的 logits(logits_to_keep=1):
+        # 本引擎每次前向后只取 out.logits[:, -1, :], 但默认会为全部位置算 logits ——
+        # 40K prompt、13 万词表时那是 40960*131072*2B ≈ 10.7 GiB, 与 8B 权重叠加直接 OOM。
+        # 只在 forward 签名真的支持该参数时传(包装/自定义模型不支持就保持原行为)。
+        try:
+            supports_logits_to_keep = "logits_to_keep" in inspect.signature(
+                self.model.forward).parameters
+        except (TypeError, ValueError):
+            supports_logits_to_keep = False
+        self._logits_kwargs = {"logits_to_keep": 1} if supports_logits_to_keep else {}
         # 对外模型名: 优先用 --served-model-name(与 vLLM 语义一致), 否则取路径最后一段
         self.model_name = (self.config.served_model_name
                            or self.config.model.rstrip("/").split("/")[-1]
@@ -147,7 +172,34 @@ class LLMEngine:
                          or self.model.config._attn_implementation or "auto")
         logger.info("模型加载完成: %s (%.2fs), attention 实现: %s",
                     self.model_name, time.time() - t0, resolved_impl)
+        if self.rotary_emb is None:
+            logger.warning("未找到文本解码器的 RoPE 模块, --graft-rope-rebase 将按"
+                           "默认 RoPE 公式重映射(缩放型 RoPE 如 YaRN 会不准确)")
         logger.info("KV cache 每 token 占用(理论): %.2f MiB", self.kv_bytes_per_token / (1024 ** 2))
+
+    @property
+    def model_config(self):
+        """KV 形状 / 位置 / RoPE 计算使用的 config, 一律是**文本塔** config.
+
+        多模态包装(如 Ministral-3 的 Mistral3ForConditionalGeneration)的顶层
+        config 没有 num_hidden_layers / rope_parameters / head_dim, 必须换成
+        `config.get_text_config(decoder=True)`; _load_model 会把结果存进
+        `_model_config`。只构造引擎对象不加载模型的桩(测试)回退 model.config。
+        """
+        config = getattr(self, "_model_config", None)
+        return config if config is not None else self.model.config
+
+    @property
+    def rotary_emb(self):
+        """文本解码器的 RoPE 模块(--graft-rope-rebase 用); 桩对象上按需探测一次."""
+        if hasattr(self, "_rotary_emb"):        # _load_model 已探测(结果可能是 None)
+            return self._rotary_emb
+        return resolve_rotary_emb(self.model)   # 只构造引擎对象不加载模型的桩(测试)
+
+    @property
+    def logits_kwargs(self) -> dict:
+        """前向时只算末尾 logits 的参数(见 _load_model); 桩对象上为空."""
+        return getattr(self, "_logits_kwargs", {})
 
     @property
     def kv_bytes_per_token(self) -> int:
@@ -156,7 +208,7 @@ class LLMEngine:
         公式: 2(K 和 V) x 层数 x KV头数 x head_dim x 每元素字节数
         这是理解 KV cache 内存开销的关键数字.
         """
-        c = self.model.config
+        c = self.model_config
         num_layers = c.num_hidden_layers
         num_kv_heads = getattr(c, "num_key_value_heads", None) or c.num_attention_heads
         head_dim = getattr(c, "head_dim", None) or (c.hidden_size // c.num_attention_heads)
@@ -164,13 +216,20 @@ class LLMEngine:
         return 2 * num_layers * num_kv_heads * head_dim * dtype_size
 
     def _eos_ids(self) -> set[int]:
-        """收集所有需要触发停止的 eos token id."""
+        """收集所有需要触发停止的 eos token id.
+
+        顶层 config 不一定有 eos_token_id(多模态包装的 config 就没有, 如
+        Mistral3Config), 文本 config / generation config / tokenizer 依次兜底.
+        """
         ids: set[int] = set()
-        for v in (self.model.config.eos_token_id, self.model.generation_config.eos_token_id):
-            if isinstance(v, (list, tuple)):
-                ids.update(v)
-            elif v is not None:
-                ids.add(v)
+        for source in (getattr(self.model_config, "eos_token_id", None),
+                       getattr(self.model.config, "eos_token_id", None),
+                       getattr(self.model.generation_config, "eos_token_id", None),
+                       getattr(self.tokenizer, "eos_token_id", None)):
+            if isinstance(source, (list, tuple)):
+                ids.update(int(i) for i in source)
+            elif source is not None:
+                ids.add(int(source))
         return ids
 
     # ------------------------------------------------------------------
@@ -248,7 +307,7 @@ class LLMEngine:
         eos_ids = self._eos_ids()
         generated: list[int] = []                    # 已生成的 token id
         all_ids = prompt_ids                         # 完整序列 = prompt + 已生成(采样器用)
-        cache = DynamicCache(config=self.model.config)  # KV cache 容器
+        cache = DynamicCache(config=self.model_config)  # KV cache 容器
 
         # ---- 跨请求前缀 KV 复用 ----
         # KV 依赖完整因果上下文; LCP 只能复用已知精确的前缀.
@@ -299,18 +358,18 @@ class LLMEngine:
                     request_id, len(grafts), best_len)
                 reuse_len = min(best_len, n_prompt - 1)
                 if reuse_len > 0:
-                    cache = slice_cache(best_cache, reuse_len, self.model.config)
+                    cache = slice_cache(best_cache, reuse_len, self.model_config)
             else:
                 graft_plan = (base_len, grafts)
                 if base_len > 0:
-                    cache = slice_cache(base_cache, base_len, self.model.config)
+                    cache = slice_cache(base_cache, base_len, self.model_config)
         elif use_kv_cache and reuse_prefixes:
             best_len, best_cache, best_prefix = _best_prefix(n_prompt)
             if best_len > 0:
                 # 必须深拷贝切片: transformers 的 DynamicCache.update 原地拼接,
                 # 直接把已保存的缓存传给生成循环会污染 store 里的对象
                 reuse_len = min(best_len, n_prompt - 1)
-                cache = slice_cache(best_cache, reuse_len, self.model.config)
+                cache = slice_cache(best_cache, reuse_len, self.model_config)
                 # 复用的前缀来自哪个段: 子 agent 输出(核心收益)还是 main 历史
                 src = "子 agent" if best_prefix.kind == KIND_SUB else \
                     ("main" if best_prefix.kind == KIND_MAIN else "未知来源")
@@ -400,19 +459,20 @@ class LLMEngine:
                             input_ids=prompt_ids[:, cur:graft_start],
                             attention_mask=torch.ones(1, graft_start, device=device),
                             past_key_values=cache, use_cache=True,
+                            **self.logits_kwargs,
                         )
                     graft_cache = slice_cache(
-                        item.cache, graft_len + left_trim, self.model.config)
+                        item.cache, graft_len + left_trim, self.model_config)
                     graft_cache = slice_cache(
-                        tail_cache(graft_cache, left_trim, self.model.config),
-                        graft_len, self.model.config)
+                        tail_cache(graft_cache, left_trim, self.model_config),
+                        graft_len, self.model_config)
                     if self.config.graft_rope_rebase:
                         graft_cache = rebase_rope_cache(
                             graft_cache, item.source_position + left_trim,
-                            graft_start, self.model.config)
+                            graft_start, self.model_config, rope=self.rotary_emb)
                     exact_len = min(exact_len, graft_start)
                     # 插入子输出 KV: concat 产生新对象, 后续原地拼接不会污染 store
-                    cache = concat_cache(cache, graft_cache, self.model.config)
+                    cache = concat_cache(cache, graft_cache, self.model_config)
                     cur = graft_start + graft_len
                     skipped += graft_len
                     grafted_segments += 1
@@ -422,14 +482,16 @@ class LLMEngine:
                         input_ids=prompt_ids[:, cur:],
                         attention_mask=torch.ones(1, n_prompt, device=device),
                         past_key_values=cache, use_cache=True,
+                        **self.logits_kwargs,
                     )
                     reuse_len = skipped
                 else:
-                    cache = slice_cache(cache, n_prompt - 1, self.model.config)
+                    cache = slice_cache(cache, n_prompt - 1, self.model_config)
                     out = self.model(
                         input_ids=prompt_ids[:, n_prompt - 1:],
                         attention_mask=torch.ones(1, n_prompt, device=device),
                         past_key_values=cache, use_cache=True,
+                        **self.logits_kwargs,
                     )
                     reuse_len = max(0, skipped - 1)  # 最后 1 个 token 需要前向拿 logits
                 rebase_note = " + RoPE rebase" if self.config.graft_rope_rebase else ""
@@ -447,6 +509,7 @@ class LLMEngine:
                     attention_mask=torch.ones_like(prompt_ids),
                     past_key_values=cache if use_kv_cache else None,
                     use_cache=use_kv_cache,
+                    **self.logits_kwargs,
                 )
             token = self._sample(out.logits[:, -1, :], all_ids, sampling)
             ttft_ms = (time.perf_counter() - t0) * 1000
@@ -464,12 +527,14 @@ class LLMEngine:
                     out = self.model(
                         input_ids=cur, attention_mask=mask,
                         past_key_values=cache, use_cache=True,
+                        **self.logits_kwargs,
                     )
                 else:
                     # 无缓存对照模式: 把整个前缀重新前向(注意力计算量随长度线性增长)
                     out = self.model(
                         input_ids=all_ids, attention_mask=torch.ones_like(all_ids),
                         use_cache=False,
+                        **self.logits_kwargs,
                     )
 
                 token = self._sample(out.logits[:, -1, :], all_ids, sampling)
@@ -511,9 +576,10 @@ class LLMEngine:
                         input_ids=torch.tensor([[generated[-1]]], device=self.model.device),
                         attention_mask=torch.ones(1, cur_len + 1, device=self.model.device),
                         past_key_values=cache, use_cache=True,
+                        **self.logits_kwargs,
                     )
             elif cur_len > target:
-                cache = slice_cache(cache, target, self.model.config)
+                cache = slice_cache(cache, target, self.model_config)
 
         # ---- 统计 ----
         total_ms = (time.perf_counter() - t0) * 1000

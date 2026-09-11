@@ -1,4 +1,4 @@
-"""Qwen / Hermes 风格工具调用解析(对应 vLLM 的 --tool-call-parser qwen / hermes).
+"""Qwen / Hermes / Llama / Mistral 风格工具调用解析(对应 vLLM 的 --tool-call-parser).
 
 Qwen2.5/Qwen3 模型在回复中以如下格式输出工具调用(与 Hermes 格式相同,
 vLLM 跑 Qwen3 用的 hermes parser 解析的就是这个格式):
@@ -6,6 +6,16 @@ vLLM 跑 Qwen3 用的 hermes parser 解析的就是这个格式):
     <tool_call>
     {"name": "get_weather", "arguments": {"city": "Shanghai"}}
     </tool_call>
+
+Llama 3.x 输出 `{"name": ..., "parameters": {...}}` JSON(可能带 `<|python_tag|>`);
+
+Mistral v11+ 系(Ministral 3 等)输出(见 vLLM 的 mistral parser):
+
+    [TOOL_CALLS]get_weather[ARGS]{"city": "Shanghai"}
+
+其中 `[TOOL_CALLS]`/`[ARGS]`/`[CALL_ID]` 都是特殊 token; 多个调用直接首尾相接
+(每个都以 `[TOOL_CALLS]` 开头)。v11 tokenizer 会在 name 与 `[ARGS]` 之间插入
+`[CALL_ID]<id>`, v13 不再插入(本机 Ministral-3 是 v13)。
 
 <tool_call> 等是模型的特殊 token, 生成时需要用 skip_special_tokens=False 解码,
 解析成功后转成 OpenAI 的 tool_calls 字段(与 /v1/chat/completions 响应格式一致).
@@ -15,7 +25,9 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import random
 import re
+import string
 import uuid
 from typing import Any, Dict, List, Tuple
 
@@ -26,6 +38,16 @@ TOOL_CALL_END = "</tool_call>"
 # 两个标记都是特殊 token, 解码后原样出现; 但保险起见仍按子串匹配
 TOOL_CALL_BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 THINK_START, THINK_END = "<think>", "</think>"  # engine.py 用于 think_len 统计
+
+# ---- Mistral v11+ 工具调用(vLLM 的 --tool-call-parser mistral) ----
+MISTRAL_TOOL_CALLS = "[TOOL_CALLS]"
+MISTRAL_TOOL_ARGS = "[ARGS]"
+MISTRAL_CALL_ID = "[CALL_ID]"
+# mistral-common 校验 tool_call id: a-z/A-Z/0-9, 长度固定 9(见 vLLM MistralToolCall)
+MISTRAL_CALL_ID_ALPHABET = string.ascii_letters + string.digits
+MISTRAL_CALL_ID_LEN = 9
+# 旧版(<v11)Mistral 用 [TOOL_CALLS] [{...}, {...}] 的 JSON 数组(仍兼容解析)
+MISTRAL_JSON_ARRAY = re.compile(r"\[{.*}\]", re.DOTALL)
 
 # ---- Llama 3.x JSON 工具调用(vLLM 的 --tool-call-parser llama3_json) ----
 # Llama 3.1/3.2/3.3 等模型以 JSON 形式输出工具调用(可能带 <|python_tag|> 前缀):
@@ -515,6 +537,185 @@ class LlamaJsonStreamSplitter:
 
 
 # ---------------------------------------------------------------------------
+# Mistral v11+ 工具调用
+# ---------------------------------------------------------------------------
+
+def _mistral_new_call_id() -> str:
+    """生成符合 mistral-common 校验的 tool_call id(9 位字母数字).
+
+    Mistral 的 chat template 由 mistral-common 渲染, 它会校验 id 格式: 非
+    `[a-zA-Z0-9]{9}` 直接抛 InvalidFunctionCallException —— 也就是说 id 不合规时,
+    工具结果根本回填不进下一轮 prompt, 多轮 agent 会在第二次请求上直接 400。
+    """
+    return "".join(random.choices(MISTRAL_CALL_ID_ALPHABET, k=MISTRAL_CALL_ID_LEN))
+
+
+def _mistral_arguments(raw: str | None, schema: dict | None) -> str:
+    """把 Mistral 输出里的参数原始 JSON 子串转成 OpenAI 的 arguments 字符串.
+
+    与 hermes/llama 解析一致: 能逐位保留模型原始输出就保留(模板二次渲染才能与
+    生成流对齐 —— Ministral 的 mistral-common 会把参数 json.dumps 归一化, 模型
+    自身输出的 `": "` 空格风格与之一致, 因此 LCP 能整段命中); schema 修复改变了
+    参数时改用重序列化结果。JSON 不合法时原样返回, 不静默丢成 `{}`(与 vLLM 的
+    mistral parser 一致, 让模型知道自己尝试过调用)。
+    """
+    raw = (raw or "").strip() or "{}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(data, dict) and _repair_array_args(data, schema):
+        return json.dumps(data, ensure_ascii=False)
+    return raw
+
+
+def _mistral_call(name: str, raw_args: str | None,
+                  schema: dict | None = None) -> Dict[str, Any] | None:
+    """(name, 参数原始 JSON 子串) -> OpenAI 格式工具调用; name 为空返回 None."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    return {
+        "id": _mistral_new_call_id(),
+        "type": "function",
+        "function": {"name": name, "arguments": _mistral_arguments(raw_args, schema)},
+    }
+
+
+def _mistral_head_name(head: str) -> str:
+    """从 `name[CALL_ID]<id>[ARGS]` 头部里取出函数名."""
+    for marker in (MISTRAL_CALL_ID, MISTRAL_TOOL_ARGS):
+        head = head.split(marker)[0]
+    return head.strip()
+
+
+def parse_mistral_tool_calls(text: str,
+                             schemas: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """解析 Mistral v11+ 的 `[TOOL_CALLS]name[ARGS]{json}`(支持多个连续调用).
+
+    兼容旧版 `<v11` 的 `[TOOL_CALLS] [{"name": ..., "arguments": {...}}]` 数组形式
+    (vLLM 的 mistral parser 同样两代都支持)。schemas: 函数名 -> parameters schema,
+    供 _repair_array_args 修复"字符串形式的列表"参数。
+    """
+    text = THINK_BLOCK.sub("", text)
+    if MISTRAL_TOOL_CALLS not in text:
+        return []
+    calls: List[Dict[str, Any]] = []
+    for part in text.split(MISTRAL_TOOL_CALLS)[1:]:
+        if part.lstrip().startswith("[{"):
+            # 旧版(<v11)的数组形式: [TOOL_CALLS] [{"name": ..., "arguments": {...}}]
+            calls.extend(_parse_mistral_json_array(part, schemas))
+            continue
+        brace = part.find("{")
+        head, rest = part[:brace], part[brace:]
+        raw = _match_json_value(rest, 0)
+        if raw is None:
+            raw = rest  # JSON 没闭合(或畸形): 原样收下, 由客户端/模型自行纠正
+        name = _mistral_head_name(head)
+        call = _mistral_call(name, raw, (schemas or {}).get(name))
+        if call is not None:
+            calls.append(call)
+    return calls
+
+
+def _parse_mistral_json_array(part: str,
+                              schemas: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+    """旧版 Mistral: `[TOOL_CALLS] [{...}, {...}]`(参数在 JSON 对象里)."""
+    match = MISTRAL_JSON_ARRAY.search(part)
+    if match is None:
+        return []
+    try:
+        items = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
+    calls: List[Dict[str, Any]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        args = item.get("arguments", item.get("parameters"))
+        if isinstance(args, str):
+            raw = args
+        else:
+            raw = json.dumps(args if args is not None else {}, ensure_ascii=False)
+        calls.append(_mistral_call(name, raw, (schemas or {}).get(name)))
+    return [c for c in calls if c is not None]
+
+
+def clean_mistral_content(text: str) -> str:
+    """只保留第一个 [TOOL_CALLS] 之前的文本(与 vLLM mistral parser 语义一致)."""
+    text = THINK_BLOCK.sub("", text)
+    return text.split(MISTRAL_TOOL_CALLS)[0].strip()
+
+
+class MistralStreamSplitter:
+    """把逐 token 文本流切成 content / tool_call 事件(Mistral [TOOL_CALLS] 协议).
+
+    `[TOOL_CALLS]` 之前的内容按 content 透传; 之后的 `name[CALL_ID]<id>[ARGS]`
+    头部攒起来, 等参数 JSON 闭合再产出一个 tool_call 事件, 然后回到普通模式
+    (多个调用首尾相接时会依次产出多个事件)。流结束时没闭合的调用按普通文本
+    返回(与 hermes/llama 的流式实现一致: 模型没写完就当文本, 不静默丢弃)。
+
+    用法与 ToolCallStreamSplitter 相同: events = splitter.push(chunk),
+    流结束后取 splitter.flush()。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._head = ""            # 当前调用的 `name[CALL_ID]<id>[ARGS]` 头部
+        self._state = "normal"     # normal / in_call
+
+    def _emit_content(self, events: List[Tuple[str, Any]], text: str) -> None:
+        if text:
+            events.append(("content", text))
+
+    def push(self, chunk: str) -> List[Tuple[str, Any]]:
+        events: List[Tuple[str, Any]] = []
+        self._buf += chunk
+        while True:
+            if self._state == "normal":
+                pos = self._buf.find(MISTRAL_TOOL_CALLS)
+                if pos == -1:
+                    # 只保留可能是"半个标记"的尾部, 其余立即输出
+                    hold = len(MISTRAL_TOOL_CALLS) - 1
+                    emit = max(len(self._buf) - hold, 0)
+                    if emit:
+                        self._emit_content(events, self._buf[:emit])
+                        self._buf = self._buf[emit:]
+                    break
+                if pos:
+                    self._emit_content(events, self._buf[:pos])
+                self._buf = self._buf[pos + len(MISTRAL_TOOL_CALLS):]
+                self._head, self._state = "", "in_call"
+                continue
+            brace = self._buf.find("{")
+            if brace < 0:
+                self._head += self._buf
+                self._buf = ""
+                break
+            self._head += self._buf[:brace]
+            self._buf = self._buf[brace:]
+            raw = _match_json_value(self._buf, 0)
+            if raw is None:
+                break  # 参数 JSON 未闭合: 继续攒缓冲
+            call = _mistral_call(_mistral_head_name(self._head), raw)
+            if call is not None:
+                events.append(("tool_call", call))
+            self._buf = self._buf[len(raw):]
+            self._head, self._state = "", "normal"
+        return events
+
+    def flush(self) -> List[Tuple[str, Any]]:
+        """流结束收尾: 未闭合的调用按普通文本返回."""
+        events: List[Tuple[str, Any]] = []
+        self._emit_content(events, self._head + self._buf)
+        self._head, self._buf, self._state = "", "", "normal"
+        return events
+
+
+# ---------------------------------------------------------------------------
 # 解析器分派与协议冲突回退(server 用)
 # ---------------------------------------------------------------------------
 
@@ -522,11 +723,13 @@ def parse_output_tool_calls(text: str, parser: str,
                             schemas: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     """按解析器名解析输出文本里的工具调用(qwen 与 hermes 是同一协议).
 
-    schemas: 函数名 -> parameters schema, 供两种解析器修复模型把 array
+    schemas: 函数名 -> parameters schema, 供各解析器修复模型把 array
     参数写成字符串列表的格式滑移; 为 None 时不做修复.
     """
     if parser == "llama3_json":
         return parse_llama3_json_tool_calls(text, schemas)
+    if parser == "mistral":
+        return parse_mistral_tool_calls(text, schemas)
     return parse_tool_calls(text, schemas)
 
 
@@ -534,7 +737,41 @@ def clean_output_content(text: str, parser: str) -> str:
     """按解析器名剥掉输出里的工具调用标记/think 块, 返回对话内容."""
     if parser == "llama3_json":
         return clean_llama3_json_content(text)
+    if parser == "mistral":
+        return clean_mistral_content(text)
     return clean_content(text)
+
+
+def make_stream_splitter(parser: str):
+    """按解析器名构造流式切分器(server 用)."""
+    if parser == "llama3_json":
+        return LlamaJsonStreamSplitter()
+    if parser == "mistral":
+        return MistralStreamSplitter()
+    return ToolCallStreamSplitter()
+
+
+# 三种流式切分器都实现同一组 push/flush 接口, 供 server 的类型标注使用
+StreamSplitter = ToolCallStreamSplitter | LlamaJsonStreamSplitter | MistralStreamSplitter
+
+
+def clean_tool_call_prefix(text: str, parser: str) -> str:
+    """取第一个工具调用标记之前的正文, 供"有 tool_calls 时也返回 content"使用.
+
+    刻意**不 strip**: 客户端把这段正文随 tool_calls 一起回填时模板会原样渲染,
+    只有与模型实际生成的 token 逐位一致, 跨请求 KV 前缀才能覆盖整段输出
+    (见 parse_model_output)。
+    """
+    marker = MISTRAL_TOOL_CALLS if parser == "mistral" else TOOL_CALL_START
+    pos = text.find(marker)
+    return THINK_BLOCK.sub("", text if pos < 0 else text[:pos])
+
+
+# 有 tool_calls 时仍返回"调用前正文"的协议(与 vLLM 各 parser 一致):
+#   hermes/qwen: content = 第一个 <tool_call> 之前的正文;
+#   mistral    : content = 第一个 [TOOL_CALLS] 之前的正文;
+#   llama3_json: 返回 null(JSON 调用本身就是整条消息)。
+_KEEP_PREFIX_CONTENT = ("hermes", "qwen", "mistral")
 
 
 def parse_model_output(text: str, parser: str, fallback_parser: str | None,
@@ -546,8 +783,15 @@ def parse_model_output(text: str, parser: str, fallback_parser: str | None,
       原生协议再解析一次 —— 显式配置了与模型家族不符的解析器(如 Llama 3.x
       配 hermes)时, 该解析器对模型输出永远解析不出结果, 不兜底的话工具调用
       会整段漏进 content, 客户端永远拿不到 tool_calls(只会看到原始文本);
-    - 有 tool_calls 时 content 为 None(vLLM 语义), 否则返回清理后的文本;
-      清理语义跟随最终生效的解析器(冲突时按模型原生协议剥标记).
+    - **有 tool_calls 时是否保留正文跟随模型协议**(与 vLLM 相同): Mistral/Qwen
+      系模型经常先输出一段推理正文再调工具, vLLM 的 mistral/hermes 解析器把
+      这段正文放进 content(与本文件流式切分器的行为一致), 只有 llama3_json
+      返回 null。LMInfer 早期对所有解析器都返回 null —— 代价不只是少返回一段
+      文本: 客户端回填 assistant 消息时 content 是 null, 模板渲染出的消息从
+      `[TOOL_CALLS]` 开始, 而模型实际生成的 token 从正文开始, 于是 token 级
+      LCP 在正文处就断开, 每个含工具调用的回合都白白丢掉"正文 + 工具调用"的
+      整段 KV 复用(实测 Ministral-3 的 research agent: 主 agent 复用率被压到
+      55%~82%, 其中约 347 tok 的正文本来可以整段复用)。
     - schemas 供解析时做 schema 感知的参数修复(见 _repair_array_args),
       流式路径不做修复(切流分片无法整段重写 arguments).
     """
@@ -563,5 +807,9 @@ def parse_model_output(text: str, parser: str, fallback_parser: str | None,
                 fallback_parser, len(fb_calls), fallback_parser)
             calls = fb_calls
         cleaner = fallback_parser
-    content = None if calls else (clean_output_content(text, cleaner) or None)
-    return calls, content
+    if calls:
+        content = (clean_tool_call_prefix(text, cleaner)
+                   if cleaner in _KEEP_PREFIX_CONTENT else "")
+    else:
+        content = clean_output_content(text, cleaner)
+    return calls, content or None

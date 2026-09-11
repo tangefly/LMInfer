@@ -57,10 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="vllm 后端当前只支持 1; Transformers 忽略")
     p_serve.add_argument("--kv-transfer-config", default=None,
                          help="兼容参数; Transformers 忽略; vllm 后端使用内置 agent connector, 不接受覆盖")
-    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "llama3_json", "none"], default=None,
+    p_serve.add_argument("--dequantize-fp8", action=argparse.BooleanOptionalAction, default=None,
+                         help="fine-grained FP8 权重(如 Ministral-3)在 transformers 后端是否在"
+                              "加载期反量化成模型 dtype(纯 transformers 前向, KV 切片/RoPE rebase "
+                              "保持同一种 dtype). 缺省自动: 未安装 kernels 包(FP8 前向内核)就反量化; "
+                              "--no-dequantize-fp8 强制保留 FP8(需要 kernels 包, 否则前向报错)")
+    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "llama3_json", "mistral", "none"], default=None,
                          help="工具调用解析: auto 自动识别模型家族(Qwen/Hermes 系解析 "
                               "<tool_call> 块, Llama 3.x 系解析 {\"name\":...,\"parameters\":...} "
-                              "JSON); qwen/hermes 强制块解析; llama3_json 强制 JSON 解析; "
+                              "JSON, Mistral 系解析 [TOOL_CALLS]name[ARGS]{json}); qwen/hermes 强制"
+                              "块解析; llama3_json / mistral 强制对应协议; "
                               "none 关闭. 默认 auto. 显式指定与模型家族冲突时(如 Llama 3.x "
                               "配 hermes), 启动告警并按模型原生协议兜底解析")
     p_serve.add_argument("--enable-auto-tool-choice", action="store_true",
@@ -143,6 +149,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         trust_remote_code=args.trust_remote_code,
         disable_log_stats=args.disable_log_stats,
         enable_thinking=args.enable_thinking,  # --enable-thinking=True / --no-enable-thinking=False / 缺省 None
+        dequantize_fp8=args.dequantize_fp8,    # None=自动(见 config.EngineConfig)
         tool_call_parser=args.tool_call_parser or "auto",
         enable_auto_tool_choice=args.enable_auto_tool_choice,
         reuse_agent_kv=args.reuse_agent_kv,

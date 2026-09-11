@@ -23,13 +23,13 @@ from fastapi.responses import StreamingResponse
 from .config import EngineConfig, SamplingParams
 from .engine import GenerationResult, LLMEngine
 from .kvcache import KIND_MAIN, KIND_SUB, SessionKVStore
-from .model_adapters import resolve_model_profile
+from .model_adapters import resolve_model_profile, supports_chat_template
 from .schemas import ChatCompletionRequest, ChatMessage, CompletionRequest
 from .sessions import AgentSessionRegistry
 from .toolcalls import (
     THINK_BLOCK,
-    LlamaJsonStreamSplitter,
-    ToolCallStreamSplitter,
+    StreamSplitter,
+    make_stream_splitter,
     parse_model_output,
 )
 
@@ -55,12 +55,13 @@ def create_app(engine: LLMEngine) -> FastAPI:
     # 模型适配参数: --tool-call-parser auto 在这里解析成具体解析器, 并给出
     # 模板渲染所需的参数(arguments 还原成 dict / 工具结果包成 {"output": ...})
     profile = resolve_model_profile(engine.config.tool_call_parser,
-                                    engine.tokenizer, engine.model.config)
+                                    engine.tokenizer, engine.model_config)
     if engine.config.tool_call_parser == "auto":
         logger.info("tool-call-parser=auto 自动识别为: %s", profile.tool_parser)
     # 跨请求前缀 KV 复用存储(仅 --reuse-agent-kv / --reuse-agent-kv-append 时使用, 见 kvcache.py)
-    # tokenizer 供拼接模式取 <tool_response> 包裹标记的 token id(见 SessionKVStore.build_grafts)
-    kv_store = SessionKVStore(config=engine.model.config,
+    # tokenizer 供拼接模式探测工具结果的包裹标记; config 用文本 config 构造 DynamicCache
+    # (多模态包装的顶层 config 没有 num_hidden_layers/rope_parameters)
+    kv_store = SessionKVStore(config=engine.model_config,
                               tokenizer=engine.tokenizer,
                               idle_ttl=engine.config.kv_segment_idle_ttl)
 
@@ -91,7 +92,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
         }
 
     async def _chat_streamer(req_id: str, queue: asyncio.Queue,
-                             splitter: ToolCallStreamSplitter | None = None,
+                             splitter: StreamSplitter | None = None,
                              extra: dict | None = None,
                              on_done: Callable[[GenerationResult], None] | None = None):
         """chat 流式响应生成器: role 分片 -> 文本分片 -> 结束分片 -> [DONE].
@@ -334,7 +335,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest):
         _check_model(req.model)
-        if engine.tokenizer.chat_template is None:
+        if not supports_chat_template(engine.tokenizer):
             raise HTTPException(400, "当前模型没有 chat template, 请改用 /v1/completions")
 
         # agent 模式: 建/取会话(见 _handle_agent_request)
@@ -400,11 +401,10 @@ def create_app(engine: LLMEngine) -> FastAPI:
             # 历史 assistant think 不能重新进入 prompt。Qwen3 会把计划和工具调用
             # 决策写进 think 块, 回填后容易在多轮 tool use 中重复触发同一工具。
             # KV 复用必须服从这个语义约束: LCP 少复用一段 think 输出是可接受的。
+            # (只渲染一次: Mistral 的 mistral-common 后端不支持 tokenize=False
+            #  的安全往返, 多渲染一次既慢又会打警告)
             msg_dicts = _message_dicts(req.messages, strip_assistant_think=True)
             ids = engine.tokenizer.apply_chat_template(msg_dicts, **kwargs)
-            new_kwargs = kwargs.copy()
-            new_kwargs["tokenize"] = False
-            text_prompt = engine.tokenizer.apply_chat_template(msg_dicts, **new_kwargs)
         except Exception as e:  # 模板缺参数、模板不支持 tools 等
             raise HTTPException(400, f"chat template 渲染失败: {e}")
         if hasattr(ids, "input_ids"):  # transformers 5.x 返回 tokenizers.Encoding
@@ -442,8 +442,7 @@ def create_app(engine: LLMEngine) -> FastAPI:
             # 配置解析器与模型协议冲突时直接按原生协议切流: 显式配置的解析器
             # 对该模型的输出永远不匹配, 保留它只会让工具调用整段漏进 content
             stream_parser = profile.fallback_parser or profile.tool_parser
-            splitter = (LlamaJsonStreamSplitter() if stream_parser == "llama3_json"
-                        else ToolCallStreamSplitter()) if parse_tools else None
+            splitter = make_stream_splitter(stream_parser) if parse_tools else None
             queue = await engine.generate(req_id, prompt_ids, sampling, stream=True,
                                           skip_special_tokens=not parse_tools,
                                           reuse_prefixes=reuse_prefixes,

@@ -55,14 +55,16 @@ from typing import Any
 import torch
 from transformers import DynamicCache
 
+from .model_adapters import TOOL_RESULT_WRAPPERS, resolve_tool_result_wrapper
+
 logger = logging.getLogger("lminfer")
 
 # 每个会话按请求来源保存的段类别
 KIND_MAIN = "main"   # 主 agent 请求的完整序列
 KIND_SUB = "sub"     # 子 agent 请求的完整序列(含其输出, 即"子 agent 的输出 KV")
 
-# Qwen3 chat template 渲染 tool 消息用的包裹标记(特殊 token, id 与上下文无关,
-# 拼接模式据此在渲染后的 prompt token 序列中直接定位正文窗口)
+# 兼容旧常量(Qwen3 模板的包裹标记); 实际生效的标记由 tokenizer 探测决定,
+# 见 SessionKVStore.__init__ / model_adapters.resolve_tool_result_wrapper
 TOOL_RESPONSE_OPEN = "<tool_response>"
 TOOL_RESPONSE_CLOSE = "</tool_response>"
 
@@ -163,20 +165,15 @@ def tail_cache(cache: DynamicCache, start: int, config) -> DynamicCache:
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Qwen/Llama-style RoPE half rotation."""
+    """Qwen/Llama/Mistral-style RoPE half rotation."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
-                        device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build cos/sin for RoPE position delta.
-
-    Existing K cache has already been rotated at source positions. Because RoPE
-    rotations compose, rotating by (target_position - source_position) maps it
-    to the target position for default Qwen/Llama RoPE.
-    """
+def _plain_delta_cos_sin(length: int, delta: int, head_dim: int, config,
+                         device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """默认 RoPE(rope_type=default)的位置差 cos/sin, 返回 [length, head_dim]."""
     rope_params = getattr(config, "rope_parameters", None) or {}
     theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000.0))
     inv_freq = 1.0 / (
@@ -188,13 +185,47 @@ def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
     return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
 
+def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
+                        device, dtype, rope=None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build cos/sin for a RoPE position delta, shaped [length, head_dim].
+
+    Existing K cache has already been rotated at source positions. Because RoPE
+    rotations compose per frequency, rotating by (target_position - source_position)
+    maps it to the target position. That identity holds for **any** inverse
+    frequencies, so the delta must use the model's own frequencies.
+
+    `rope` is the text decoder's rotary-embedding module (see
+    model_adapters.resolve_rotary_emb). Passing it is required for models whose
+    RoPE is not the plain `theta^(-2i/d)` formula —— YaRN / Llama-3 / dynamic
+    scaling all change inv_freq (Ministral-3 uses YaRN factor 16, where the low
+    frequencies differ from plain RoPE by 16x). Falling back to the plain formula
+    silently rotates grafted K to the wrong phase, so the fallback is only used
+    when the model exposes no rotary module at all.
+    """
+    if rope is not None:
+        try:
+            positions = torch.full((1, length), int(delta), dtype=torch.long, device=device)
+            probe = torch.zeros(1, length, 1, device=device, dtype=dtype)
+            cos, sin = rope(probe, positions)
+            cos, sin = cos[0], sin[0]
+            if cos.shape[-1] == head_dim and sin.shape[-1] == head_dim:
+                return cos.to(dtype=dtype), sin.to(dtype=dtype)
+            logger.warning("RoPE 模块输出形状 %s 与 head_dim %d 不符, "
+                           "回退默认 RoPE 公式", tuple(cos.shape), head_dim)
+        except Exception as exc:  # noqa: BLE001 - 兜底回退, 不让实验路径直接崩
+            logger.warning("调用模型 RoPE 模块失败(%r), 回退默认 RoPE 公式", exc)
+    return _plain_delta_cos_sin(length, delta, head_dim, config, device, dtype)
+
+
 def rebase_rope_cache(cache: DynamicCache, source_start: int, target_start: int,
-                      config) -> DynamicCache:
+                      config, rope=None) -> DynamicCache:
     """Deep-copy `cache` and rebase K RoPE positions from source to target.
 
     Only K carries RoPE; V is cloned unchanged. This corrects position mismatch
     for grafted sub-agent output KV, but it does not fix the different-context
-    hidden-state gap. The implementation targets default Qwen/Llama-style RoPE.
+    hidden-state gap. `rope` is the model's own rotary-embedding module: passing
+    it makes the rebase exact for scaled RoPE variants (e.g. Ministral-3's YaRN),
+    see _rope_delta_cos_sin.
     """
     delta = target_start - source_start
     if delta == 0:
@@ -209,7 +240,7 @@ def rebase_rope_cache(cache: DynamicCache, source_start: int, target_start: int,
         length = keys.shape[-2]
         head_dim = keys.shape[-1]
         cos, sin = _rope_delta_cos_sin(length, delta, head_dim, config,
-                                       keys.device, keys.dtype)
+                                       keys.device, keys.dtype, rope)
         cos = cos[None, None, :, :]
         sin = sin[None, None, :, :]
         keys = (keys * cos) + (_rotate_half(keys) * sin)
@@ -264,24 +295,27 @@ class SessionKVStore:
         self._idle_ttl = idle_ttl
         self._stats = {"reuse_attempts": 0, "reuse_hits": 0, "reuse_tokens": 0,
                        "graft_mismatches": 0}
-        # 拼接 cache 时需要模型 config 构造 DynamicCache(server 传入 engine.model.config)
+        # 拼接 cache 时需要模型 config 构造 DynamicCache(server 传入 engine.model_config)
         self._config = config
-        # 拼接模式的结构锚点: Qwen3 模板渲染 tool 消息的包裹标记是特殊 token,
-        # id 与上下文无关, build_graft 据此在 prompt 中直接定位正文窗口(见
-        # TOOL_RESPONSE_OPEN/CLOSE)。tokenizer 缺失或标记不存在(含被当成未知
-        # token 的情况)时置 None, 拼接模式自动不可用, 回退 LCP 复用。
+        # 拼接模式的结构锚点: chat template 渲染 tool 消息时用一对特殊 token 包裹
+        # 子 agent 输出正文(如 Qwen3 的 <tool_response>、Mistral 的 [TOOL_RESULTS])。
+        # 标记 id 与上下文无关, build_grafts 据此在 prompt 中直接定位正文窗口。
+        # 按 tokenizer 探测实际生效的那一对(见 model_adapters); 探测不到时拼接模式
+        # 自动不可用, 回退 LCP 复用。
         self._resp_marker_ids: tuple[int | None, int | None] = (None, None)
+        self._wrapper: tuple[str, str] | None = None
         if tokenizer is not None:
-            open_id = tokenizer.convert_tokens_to_ids(TOOL_RESPONSE_OPEN)
-            close_id = tokenizer.convert_tokens_to_ids(TOOL_RESPONSE_CLOSE)
-            if (isinstance(open_id, int) and isinstance(close_id, int)
-                    and tokenizer.convert_ids_to_tokens(open_id) == TOOL_RESPONSE_OPEN
-                    and tokenizer.convert_ids_to_tokens(close_id) == TOOL_RESPONSE_CLOSE):
-                self._resp_marker_ids = (open_id, close_id)
-            else:
-                logger.warning("tokenizer 没有 %s/%s 特殊 token, 拼接模式"
+            wrapper = resolve_tool_result_wrapper(tokenizer)
+            if wrapper is None:
+                logger.warning("tokenizer 没有工具结果包裹标记(%s), 拼接模式"
                                "(--reuse-agent-kv-append)不可用, 回退 LCP 复用",
-                               TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE)
+                               " / ".join("/".join(p) for p in TOOL_RESULT_WRAPPERS))
+            else:
+                self._wrapper = wrapper
+                self._resp_marker_ids = (tokenizer.convert_tokens_to_ids(wrapper[0]),
+                                         tokenizer.convert_tokens_to_ids(wrapper[1]))
+                logger.info("拼接模式使用工具结果包裹标记: %s/%s (id %s)", *wrapper,
+                            self._resp_marker_ids)
 
     def _prune_idle(self, now: float) -> None:
         """清理闲置超过 idle_ttl 的会话段(会话注册表本身无 TTL, 这里兜底防显存泄漏).
@@ -493,7 +527,7 @@ class SessionKVStore:
         if not windows:
             logger.info("会话 %s: prompt 中未找到 %s/%s 包裹标记, "
                         "放弃拼接(回退 LCP)", session_id,
-                        TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE)
+                        *(self._wrapper or (TOOL_RESPONSE_OPEN, TOOL_RESPONSE_CLOSE)))
             return []
 
         grafts: list[KVGraft] = []

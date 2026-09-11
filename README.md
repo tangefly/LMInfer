@@ -68,6 +68,13 @@ lminfer serve --model /home/tanger/workspace/models/Qwen3-0.6B --max-num-seqs 4
 # Llama 3.1 系(工具调用 JSON 格式自动识别, 无需额外参数)
 lminfer serve /home/tanger/workspace/models/Meta-Llama-3.1-8B-Instruct --port 8000
 
+# Mistral 系 / Ministral-3(FP8 多模态 checkpoint; 工具调用 [TOOL_CALLS]name[ARGS]{json})
+lminfer serve /home/tanger/workspace/models/Ministral-3-8B-Instruct-2512 \
+    --served-model-name Ministral-3-8B --max-model-len 40960 \
+    --reuse-agent-kv-append --graft-rope-rebase \
+    --repair-window-begin 0.1 --repair-window-end 0.1 \
+    --enable-auto-tool-choice --port 8000
+
 # 也可以不带参数安装直接运行
 python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 ```
@@ -77,6 +84,8 @@ python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 等参数会被接受，但朴素实现中不生效（启动时会打印 WARNING 说明原因）。
 `--tool-call-parser` 与 `--enable-auto-tool-choice` 真实生效，
 见下文 [工具调用](#工具调用原生-tool-call)。
+模型家族差异（多模态包装 / FP8 权重）会自动适配，见
+[模型适配](#模型适配qwen--llama--mistral--多模态--fp8)。
 
 `--reuse-agent-kv` 是 agent 模式下的跨请求 KV 前缀复用开关（默认关闭），
 详见下文 [跨请求 KV 复用](#跨请求-kv-复用--reuse-agent-kv)。
@@ -134,9 +143,12 @@ lminfer serve /path/to/model --enable-auto-tool-choice                          
   - Llama 3.x 系（有 `<|python_tag|>` 特殊 token）走 `llama3_json`：解析输出里的
     `{"name": ..., "parameters": ...}` JSON 工具调用（可多个、以 `;` 分隔、周围
     允许普通文本），对应 vLLM 的 `--tool-call-parser llama3_json`；
+  - Mistral v11+ 系（有 `[TOOL_CALLS]` 特殊 token，如 Ministral-3）走 `mistral`：
+    解析输出里的 `[TOOL_CALLS]name[ARGS]{json}`（可多个首尾相接，name 与 `[ARGS]`
+    之间可能有 `[CALL_ID]<id>`），对应 vLLM 的 `--tool-call-parser mistral`；
   - 都没有则 `none` 关闭解析，输出按普通文本返回。
-  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `none` 强制使用某解析器，
-  但注意 **`hermes` 只能解析 `<tool_call>` 块、`llama3_json` 只能解析 JSON 调用**：
+  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `mistral` / `none` 强制使用某
+  解析器，但注意 **每个解析器只认自己那套标记**：
   给 Llama 3.x 模型配 `hermes`（或反之）会解析不到任何工具调用，工具调用文本会
   整段漏进 `content`、客户端拿不到 `tool_calls`。为避免这类静默失效，显式配置与
   模型家族冲突时服务会：启动时告警，请求时先按显式配置解析、解析不到再按模型
@@ -171,6 +183,56 @@ Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做�
    字面量解析（`ast.literal_eval`，安全），成功且结果是列表则还原成真正的 JSON
    数组再返回；修复改变了参数时 `arguments` 改用重序列化结果（不再逐位保留）。
    hermes 块解析同样支持该修复；流式路径不做（分片无法整段重写）。
+
+### 模型适配（Qwen / Llama / Mistral / 多模态 / FP8）
+
+除工具调用协议外，"模型怎么加载、KV 怎么拼"也有家族差异，全部集中在
+`lminfer/model_adapters.py`（加载/协议识别）与 `lminfer/kvcache.py`（KV 拼接）。
+
+**Mistral 系（Ministral-3-8B-Instruct-2512 实测）**
+
+1. **工具调用**（`mistral` 解析器）：输出形如
+   `[TOOL_CALLS]call_subagent[ARGS]{"task": "..."}`，多个调用首尾相接。
+   `[TOOL_CALLS]` / `[ARGS]` / `[CALL_ID]` / `[TOOL_RESULTS]` 都是特殊 token；
+   兼容旧版（`<v11`）的 `[TOOL_CALLS] [{...}]` 数组形式。`arguments` 保留模型
+   原始 JSON 子串（round-trip 保真）。
+2. **tool_call id 必须是 9 位字母数字**：Mistral 的 prompt 由 transformers 的
+   `MistralCommonBackend` 交给 **mistral-common** 渲染（而不是 jinja），它会校验
+   `[a-zA-Z0-9]{9}`，不合规直接抛 `InvalidFunctionCallException`。若沿用其他协议的
+   `call_<hex>` id，第二轮请求会 400 —— 工具结果根本回填不进 prompt。因此该解析器
+   生成 9 位字母数字 id（与 vLLM 的 `MistralToolCall` 一致）。
+3. **`chat_template is None` 不代表没有模板**：Mistral 的 tokenizer 不加载模型自带的
+   `chat_template.jinja`，`tokenizer.chat_template` 恒为 None，但
+   `apply_chat_template` 完全可用。服务端改用 `supports_chat_template()` 判定，
+   否则 `/v1/chat/completions` 会对 Ministral 直接返回 400。
+4. **拼接锚点是 `[TOOL_RESULTS]` / `[/TOOL_RESULTS]`**：拼接模式不再硬编码 Qwen3 的
+   `<tool_response>`，而是按 tokenizer 探测这一对包裹标记（`TOOL_RESULT_WRAPPERS`），
+   探测不到就自动回退 LCP 复用。Ministral 的正文窗口实测**逐位全中**
+   （`定位子 agent 输出 KV 1 段/301 tok（窗口 301 tok）`，无边界漂移）。
+5. **多模态包装只取文本塔**：checkpoint 架构是
+   `Mistral3ForConditionalGeneration`（8.4B 语言模型 + 0.4B 视觉塔），
+   `AutoModelForCausalLM` 不认识它。加载时改用 `AutoModelForImageTextToText`，
+   只跑文本路径，并把 `config.get_text_config(decoder=True)` 作为引擎的
+   `model_config` —— 顶层 config 连 `num_hidden_layers` / `rope_parameters` 都没有，
+   直接拿来算 KV 形状或 RoPE 会错。
+6. **FP8 权重默认反量化**：checkpoint 是 per-tensor fine-grained FP8（`weight_scale_inv`
+   是标量），前向需要 `kernels` 包提供的 Triton 内核；没装时 transformers 会报
+   `ImportError`。适配层在加载期用 `FineGrainedFP8Config(dequantize=True)` 反量化成
+   模型 dtype（纯 transformers 路径，KV 切片与 RoPE rebase 都保持同一种 dtype），
+   启动日志会打印实际路径；装了 kernels 包则保留原生 FP8，可用
+   `--dequantize-fp8/--no-dequantize-fp8` 强制。8.4B 权重反量化后约占 16.6 GiB 显存。
+7. **YaRN RoPE 的位置重映射**：Ministral-3 声明 `rope_type=yarn`（factor 16），
+   低频频段的逆频率与默认 `theta^(-2i/d)` 公式相差 16 倍。RoPE 只有"每频率旋转
+   可复合"这一条性质被 rebase 依赖（与逆频率取值无关），所以只要用**模型自己的**
+   逆频率算位置差即可；`rebase_rope_cache` 因此优先调用模型文本塔的 `rotary_emb`
+   模块（`--graft-rope-rebase`）。实测：用模型 RoPE 时与"直接在目标位置旋转"
+   相差 4.8e-7（float32 舍入），用旧的默认公式最大偏差 **6.6**（K 的量级是 1）——
+   即旧实现对 YaRN 模型会转到完全错误的相位。
+   位置缩放类 RoPE（YaRN / Llama-3 / dynamic）都适用；`llama_4_scaling` 只作用在
+   query 侧（`get_llama_4_attn_scale`），不影响 K 侧 rebase。
+
+完整的适配清单、启动命令与实测日志见
+[Ministral-3 适配记录](docs/ministral3.md)。
 
 ```bash
 # 带 tools 的请求: 模型会输出 <tool_call> 块, 服务端解析为 tool_calls 返回
@@ -292,7 +354,12 @@ python experiments/agent_kv_reuse.py --model /path/to/model
   长度。Qwen3 会对**末尾 assistant 消息**插入 `<think>` 块（与后续有 tool
   消息时的渲染不同），导致 LCP 变短（约 30%）；ERNIE 等模板渲染一致，
   复用率可达 80%+。Llama 3.1 的模板对历史逐字一致渲染（无 think 块插入），
-  实测复用率 82%–92%（`Meta-Llama-3.1-8B-Instruct`，agent 多轮续接）；
+  实测复用率 82%–92%（`Meta-Llama-3.1-8B-Instruct`，agent 多轮续接）。
+  Ministral-3（mistral-common 渲染）实测同样逐字一致：主 agent 第一轮生成的
+  `[TOOL_CALLS]name[ARGS]{json}` 与下一轮重新渲染的 token 完全相同（模型输出的
+  `": "` 空格风格与 mistral-common 的 `json.dumps` 归一化结果一致），最后一步
+  **复用 850/993 tok（86% 的 prefill 被跳过）**；若模型退化输出紧凑 JSON，
+  LCP 会在参数处提前停止，属安全回退；
 - **数值等价性**：复用与全量 prefill 数学上等价，但 bf16 精度下存在
   内核级舍入差异（与切换 attention 实现同级，~1e-2 相对误差），贪心输出
   通常逐 token 一致，个别低置信位置可能翻转，属正常现象；
@@ -303,7 +370,8 @@ python experiments/agent_kv_reuse.py --model /path/to/model
 
 LCP 安全模式只能复用"前缀完全一致"的 KV。子 agent 的输出作为 tool 结果
 回填进 main 的下一轮 prompt 时，其 token 由 chat template 重新渲染（正文
-前后带 role 标记，如 Qwen3 的 `<tool_response>` 包裹），不构成任何已保存
+前后带 role 标记，如 Qwen3 的 `<tool_response>`、Mistral 的 `[TOOL_RESULTS]`
+包裹），不构成任何已保存
 段的公共前缀，LCP 匹配不到 —— 这段 KV 明明在子 agent 请求里已经算过，
 却只能重新 prefill。若想**直接复用子 agent 输出的 KV**，用拼接模式：
 
@@ -321,16 +389,23 @@ lminfer serve /path/to/model --reuse-agent-kv-append
               LCP 复用  prefill   ↑ graft    prefill   ↑ graft    prefill
 ```
 
-- **锚点**：子输出是"本轮新内容"，搜索起点取最新 main 段长度，历史里与
-  子输出相似的文本（如任务原文）直接被排除；
+- **锚点**：包裹标记由 tokenizer 探测得到（Qwen3 是 `<tool_response>`，Mistral 是
+  `[TOOL_RESULTS]`，见 `TOOL_RESULT_WRAPPERS`），两端都必须是单个特殊 token；
+  探测不到时拼接模式自动不可用（启动日志会说明），退化为 LCP 复用。子输出是
+  "本轮新内容"，搜索起点取最新 main 段长度，历史里与子输出相似的文本（如任务
+  原文）直接被排除；
 - **边界漂移**：客户端把输出解码成文本再回填，模板对同一文本重新分词 ——
   BPE 对同一字符串的切分是确定的，但正文首尾可能与其相邻的换行/标记合并
   （如结尾 `。` 与模板追加的 `\n` 合成一个 token），导致渲染出的 token 与
   保存的正文在边界处不一致。`build_graft` 搜索**最长逐位一致前缀**（允许
   开头 1-2 个 token 并入前一标记），只拼接一致的部分，其余（通常是尾部
-  1-2 个边界 token）正常 prefill —— 拼接的 KV 与 token 严格对齐；
+  1-2 个边界 token）正常 prefill —— 拼接的 KV 与 token 严格对齐。
+  Mistral 的 `[TOOL_RESULTS]` 本身是特殊 token，正文不会被前一个标记吞并，
+  实测窗口与子输出逐位全中（Ministral-3: `定位子 agent 输出 KV 1 段/301 tok
+  (窗口 301 tok, 输出 301 tok)`）；
 - **剔除 thinking**：`<think>...</think>` 块通常不作为下一轮对话的 prompt
-  （客户端回填时剥离），子段输出里开头 think 块的 KV 被挖掉，只拼接正文；
+  （客户端回填时剥离），子段输出里开头 think 块的 KV 被挖掉，只拼接正文
+  （Ministral-3 没有 think token，该步骤自动禁用）；
 - **回退**：定位失败或匹配太短（< 4 token）时安全回退到 LCP 模式（复用
   main 历史），绝不错误拼接。校验失败记入 `/v1/stats` 的 `graft_mismatches`。
 
@@ -358,6 +433,19 @@ KV 首尾的重计算比例。例如匹配到 100 token 时，首部重算 15 �
 与 `--reuse-agent-kv`（LCP 模式）的关系：拼接模式是 LCP 模式的超集 ——
 main 历史仍按 LCP 精确复用，定位失败时自动回退到 LCP 行为，因此单独开
 `--reuse-agent-kv-append` 即可同时获得两者收益。
+
+`--graft-rope-rebase` 在插入前把子输出 K 从子上下文位置重映射到 main prompt
+的插入位置。它使用**模型文本塔自己的 RoPE 逆频率**（见
+[模型适配](#模型适配qwen--llama--mistral--多模态--fp8) 第 7 条），因此对
+YaRN / Llama-3 / dynamic 等缩放型 RoPE 同样正确；只修正位置差，不修正上下文差。
+模型没有可用的 RoPE 模块时按默认公式回退并打印 WARNING。
+
+Ministral-3-8B-Instruct-2512 实测（两个问题、main → sub → main → sub → main，
+`--reuse-agent-kv-append --graft-rope-rebase --repair-window-begin 0.1
+--repair-window-end 0.1`）：7 次请求 4 次命中复用、共跳过 2312 tok，
+`graft_mismatches` 为 0，最后一步 850/993 tok（86%）；拼接日志形如
+`拼接子 agent 输出 KV 1/1 段, 241/301 tok(位置 691..991) + RoPE rebase,
+每段首部重算 10.0%, 尾部重算 10.0% + 复用 main 历史 KV 609 tok, 剩余 143 tok prefill`。
 
 ### 上下文误差驱动的分层修复
 

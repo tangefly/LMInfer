@@ -22,8 +22,12 @@ class EngineConfig:
     trust_remote_code: bool = False  # 允许执行远程模型代码(个别模型需要)
     disable_log_stats: bool = False  # 关闭每请求统计日志
     enable_thinking: bool | None = None  # Qwen3 等模型的 thinking 开关, None 表示不传
+    dequantize_fp8: bool | None = None  # fine-grained FP8 权重(如 Ministral-3)是否在加载期
+                                        # 反量化成模型 dtype: None=自动(没装 kernels 包就反量化),
+                                        # True/False 由 --dequantize-fp8/--no-dequantize-fp8 强制
     tool_call_parser: str = "auto"  # auto/qwen/hermes: 解析 <tool_call> 块; llama3_json:
                                     # 解析 Llama 3.x 的 {"name":...,"parameters":...} JSON;
+                                    # mistral: 解析 [TOOL_CALLS]name[ARGS]{json};
                                     # none: 关闭解析. auto 按模型 tokenizer 自动识别
                                     # (见 model_adapters.py, 对应 vLLM 的 --tool-call-parser)
     enable_auto_tool_choice: bool = False  # 请求带 tools 且未显式给 tool_choice 时默认按 auto
