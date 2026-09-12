@@ -9,15 +9,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from transformers import Glm4Config, Mistral3Config, Qwen3Config
+from transformers import Glm4Config, Mistral3Config, Qwen3Config, Qwen3MoeConfig
 
 from lminfer import model_adapters
 from lminfer.model_adapters import (
+    RopeLayout,
     _is_finegrained_fp8,
     _supports_causal_lm,
     load_text_model,
+    resolve_model_profile,
     resolve_rope_layout,
     resolve_rotary_emb,
+    resolve_tool_result_wrapper,
 )
 
 
@@ -152,6 +155,66 @@ class ResolveRopeLayoutTest(unittest.TestCase):
         config.partial_rotary_factor = 0.5
         layout = resolve_rope_layout(config)
         self.assertEqual(layout.rotary_dim, config.head_dim // 2)
+
+
+class _QwenStubTokenizer:
+    """Qwen 系 tokenizer 桩: 只需自动识别与窗口探测用到的两个方法."""
+
+    _TOKENS = {token: i for i, token in enumerate(
+        ["<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+         "<think>", "</think>"])}
+
+    def convert_tokens_to_ids(self, token):
+        return self._TOKENS.get(token, -1)
+
+    def convert_ids_to_tokens(self, tid):
+        return next((t for t, i in self._TOKENS.items() if i == tid), None)
+
+
+class Qwen3MoeFamilyTest(unittest.TestCase):
+    """Qwen3-MoE(Qwen3-30B-A3B-Instruct-2507) 的家族判定: 协议与 dense Qwen3 相同.
+
+    差异只在专家路由带来的权重结构/显存/速度, 不在工具调用协议、KV 形状或 RoPE
+    布局上 —— 所以适配层不需要新分叉, 但 auto 判定必须落在 hermes + `<tool_response>`
+    窗口上(否则 MoE 模型会被判成 none, 工具调用解析与拼接模式双双静默失效)。
+    """
+
+    def test_causal_lm_and_rope_layout_match_dense_qwen3(self):
+        config = Qwen3MoeConfig(head_dim=128)
+        self.assertTrue(_supports_causal_lm(config))
+        self.assertEqual(resolve_rope_layout(config, 128),
+                         RopeLayout(rotary_dim=128, interleaved=False))
+
+    def test_tool_protocol_and_window_match_dense_qwen3(self):
+        tokenizer = _QwenStubTokenizer()
+        profile = resolve_model_profile("auto", tokenizer, Qwen3MoeConfig(head_dim=128))
+        self.assertEqual(profile.tool_parser, "hermes")
+        self.assertIsNone(profile.fallback_parser)
+        self.assertEqual(profile.tool_protocol, "openai")
+        self.assertFalse(profile.arguments_as_dict)
+        wrapper = resolve_tool_result_wrapper(tokenizer)
+        self.assertEqual((wrapper.open_marker, wrapper.close_marker),
+                         ("<tool_response>", "</tool_response>"))
+
+
+class ResolveLogitsKwargsTest(unittest.TestCase):
+    """前向只要末尾 logits: 只对声明了 logits_to_keep 的模型传该参数."""
+
+    def test_passed_when_forward_supports_it(self):
+        model = SimpleNamespace(forward=lambda input_ids, logits_to_keep=1, **kw: None)
+        self.assertEqual(model_adapters.resolve_logits_kwargs(model), {"logits_to_keep": 1})
+
+    def test_empty_when_forward_does_not_support_it(self):
+        model = SimpleNamespace(forward=lambda input_ids, **kw: None)
+        self.assertEqual(model_adapters.resolve_logits_kwargs(model), {})
+
+    def test_real_moe_forward_supports_it(self):
+        from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+        model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+            vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=8, moe_intermediate_size=8,
+            num_experts=2, num_experts_per_tok=1))
+        self.assertEqual(model_adapters.resolve_logits_kwargs(model), {"logits_to_keep": 1})
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@
 
 import asyncio
 import functools
-import inspect
 import logging
 import time
 import uuid
@@ -36,7 +35,7 @@ from transformers import (
 )
 
 from .config import EngineConfig, SamplingParams
-from .model_adapters import load_text_model, resolve_rotary_emb
+from .model_adapters import load_text_model, resolve_logits_kwargs, resolve_rotary_emb
 from .repair import repair_token_counts
 from .context_repair import context_prefill, exact_prefill
 from .kvcache import (
@@ -156,12 +155,8 @@ class LLMEngine:
         # 本引擎每次前向后只取 out.logits[:, -1, :], 但默认会为全部位置算 logits ——
         # 40K prompt、13 万词表时那是 40960*131072*2B ≈ 10.7 GiB, 与 8B 权重叠加直接 OOM。
         # 只在 forward 签名真的支持该参数时传(包装/自定义模型不支持就保持原行为)。
-        try:
-            supports_logits_to_keep = "logits_to_keep" in inspect.signature(
-                self.model.forward).parameters
-        except (TypeError, ValueError):
-            supports_logits_to_keep = False
-        self._logits_kwargs = {"logits_to_keep": 1} if supports_logits_to_keep else {}
+        # context repair 的 exact_prefill 共用同一探测(见 model_adapters)。
+        self._logits_kwargs = resolve_logits_kwargs(self.model)
         # 对外模型名: 优先用 --served-model-name(与 vLLM 语义一致), 否则取路径最后一段
         self.model_name = (self.config.served_model_name
                            or self.config.model.rstrip("/").split("/")[-1]

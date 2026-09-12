@@ -82,6 +82,13 @@ lminfer serve /home/tanger/workspace/models/GLM-4-9B-0414 \
     --repair-window-begin 0.1 --repair-window-end 0.1 \
     --enable-auto-tool-choice --port 8000
 
+# Qwen3 MoE / Qwen3-30B-A3B-Instruct-2507(协议与 dense Qwen3 相同; 权重约 58 GiB, 单卡 80GB)
+lminfer serve /public/home/xiaoxunpeng/Models/Qwen3-30B-A3B-Instruct-2507 \
+    --served-model-name Qwen3-30B-A3B-Instruct-2507 --max-model-len 40960 \
+    --reuse-agent-kv-append --graft-rope-rebase \
+    --repair-window-begin 0.1 --repair-window-end 0.1 \
+    --enable-auto-tool-choice --port 8000
+
 # 也可以不带参数安装直接运行
 python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 ```
@@ -92,7 +99,7 @@ python -m lminfer serve /home/tanger/workspace/models/Qwen3-0.6B
 `--tool-call-parser` 与 `--enable-auto-tool-choice` 真实生效，
 见下文 [工具调用](#工具调用原生-tool-call)。
 模型家族差异（多模态包装 / FP8 权重）会自动适配，见
-[模型适配](#模型适配qwen--llama--mistral--多模态--fp8)。
+[模型适配](#模型适配qwen--qwen3-moe--llama--mistral--glm-4--多模态--fp8)。
 
 `--reuse-agent-kv` 是 agent 模式下的跨请求 KV 前缀复用开关（默认关闭），
 详见下文 [跨请求 KV 复用](#跨请求-kv-复用--reuse-agent-kv)。
@@ -195,7 +202,7 @@ Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做�
    数组再返回；修复改变了参数时 `arguments` 改用重序列化结果（不再逐位保留）。
    hermes 块解析同样支持该修复；流式路径不做（分片无法整段重写）。
 
-### 模型适配（Qwen / Llama / Mistral / GLM-4 / 多模态 / FP8）
+### 模型适配（Qwen / Qwen3-MoE / Llama / Mistral / GLM-4 / 多模态 / FP8）
 
 除工具调用协议外，"模型怎么加载、KV 怎么拼"也有家族差异，全部集中在
 `lminfer/model_adapters.py`（加载/协议识别）与 `lminfer/kvcache.py`（KV 拼接）。
@@ -272,6 +279,31 @@ Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做�
    多个调用拆成多条消息（与模型卡 README 的处理一致）；agent 场景本来就要求一次一个。
 
 完整的适配清单、启动命令与实测日志见 [GLM-4 适配记录](docs/glm4.md)。
+
+**Qwen3-MoE 系（Qwen3-30B-A3B-Instruct-2507 实测）**
+
+MoE 模型**不需要新的协议适配**：工具调用是同一套 hermes 协议、工具结果窗口是同一对
+`<tool_response>`、KV 形状与 RoPE 布局也只由注意力决定（128 专家 / top-8 的路由不参与
+KV）。差异在显存与一条回退路径上：
+
+1. **加载走纯文本分支**：`Qwen3MoeForCausalLM` 在 `AutoModelForCausalLM` 里，
+   16 个分片（30B 参数、bf16）加载后占 **57.7 GiB** 显存，单张 80GB 卡可跑
+   （36K 上下文实测峰值 68.8 GiB）；KV 是 `2 × 48 层 × 4 KV 头 × 128 × 2B = 0.09 MiB/token`，
+   与 dense 同公式；
+2. **RoPE 是 `Qwen3MoeRotaryEmbedding`**（全 128 维旋转、前后对半配对，theta 1e7）：
+   `--graft-rope-rebase` 按模型自己的逆频率重映射，实测与「直接在目标位置旋转」
+   相差 4.8e-07（`tests/test_kvcache.py::Qwen3MoeRopeRebaseTest`）；
+3. **分层 `context` 修复不适用**：它直接调用 `layer.self_attn` / `layer.mlp`，那是
+   dense 层结构；MoE 上会打印原因并**自动回退整段重算的 `exact_prefill`**（结果精确、
+   不省 prefill）。`--repair-mode window` / `exact` 正常可用；
+4. **回退路径只算末尾 logits**（本次适配的代码改动）：`exact_prefill` 现在也传
+   `logits_to_keep=1`（`model_adapters.resolve_logits_kwargs`，引擎 prefill 用同一探测）。
+   否则 151936 词表的 30B 模型在 40K prompt 下要额外分配
+   `40960 × 151936 × 2B ≈ 11.6 GiB` 的 logits 临时张量，与 58 GiB 权重叠加直接 OOM；
+5. **Instruct-2507 是非 thinking 模型**：模板没有 `enable_thinking` 分支（带该字段
+   不报错、也不产生 think 块），`<think>` 检测自动失效（`think_len` 恒为 0）。
+
+完整的适配清单、启动命令与实测日志见 [Qwen3-30B-A3B 适配记录](docs/qwen3moe.md)。
 
 ```bash
 # 带 tools 的请求: 模型会输出 <tool_call> 块, 服务端解析为 tool_calls 返回
@@ -476,7 +508,7 @@ main 历史仍按 LCP 精确复用，定位失败时自动回退到 LCP 行为�
 
 `--graft-rope-rebase` 在插入前把子输出 K 从子上下文位置重映射到 main prompt
 的插入位置。它使用**模型文本塔自己的 RoPE 逆频率**（见
-[模型适配](#模型适配qwen--llama--mistral--多模态--fp8) 第 7 条），因此对
+[模型适配](#模型适配qwen--qwen3-moe--llama--mistral--glm-4--多模态--fp8) 第 7 条），因此对
 YaRN / Llama-3 / dynamic 等缩放型 RoPE 同样正确；只修正位置差，不修正上下文差。
 模型没有可用的 RoPE 模块时按默认公式回退并打印 WARNING。
 

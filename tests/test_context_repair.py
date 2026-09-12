@@ -2,10 +2,11 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-from transformers import Qwen3Config, Qwen3ForCausalLM, DynamicCache
+from transformers import (DynamicCache, Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig,
+                          Qwen3MoeForCausalLM)
 
 from lminfer.config import EngineConfig, SamplingParams
-from lminfer.context_repair import context_prefill
+from lminfer.context_repair import context_prefill, support_reason
 from lminfer.engine import LLMEngine
 from lminfer.kvcache import KVGraft, KVPrefix, SessionKVStore, slice_cache, tail_cache, rebase_rope_cache
 
@@ -168,6 +169,42 @@ class ContextRepairTest(unittest.TestCase):
         out = context_prefill(self.model, self.ids, self.prefix, 3, [bad], self.options())
         self.assertEqual(out.exact_prefix_len, 30)
         self.assertIn('mismatch', out.stats['fallback_reason'])
+
+
+class Qwen3MoeFallbackTest(unittest.TestCase):
+    """MoE 模型(Qwen3-30B-A3B)不走分层 context 修复: 回退到整段重算的 exact_prefill.
+
+    分层修复直接调用 `layer.self_attn` / `layer.mlp` 手工拼前向, 那是 dense Qwen3
+    的层结构; MoE 层的 MLP 是稀疏专家路由, 拿不到同样的语义。适配方式是**明确回退**
+    (结果正确、只是不省 prefill), 日志里带出原因, 而不是静默给出近似错误的结果。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        torch.set_num_threads(1)
+        c = Qwen3MoeConfig(vocab_size=97, hidden_size=32, num_hidden_layers=4,
+                           num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+                           moe_intermediate_size=16, num_experts=4, num_experts_per_tok=2,
+                           eos_token_id=96)
+        c._attn_implementation = 'sdpa'
+        cls.model = Qwen3MoeForCausalLM(c).eval()
+        cls.ids = torch.randint(0, 90, (1, 12))
+
+    def options(self, **kw):
+        return EngineConfig(model='tiny-moe', repair_mode='context', **kw)
+
+    def test_support_reason_rejects_moe(self):
+        self.assertIn("dense Qwen3", support_reason(self.model))
+
+    def test_context_prefill_falls_back_to_exact_with_reason(self):
+        empty = DynamicCache(config=self.model.config)
+        out = context_prefill(self.model, self.ids, empty, 0, [], self.options())
+        self.assertEqual(out.exact_prefix_len, 12)
+        self.assertEqual(out.stats['fallback_reason'],
+                         'context repair requires a dense Qwen3 model with >= 2 layers')
+        with torch.inference_mode():
+            expected = self.model(self.ids, use_cache=True).logits[:, -1:]
+        torch.testing.assert_close(out.logits, expected, atol=1e-6, rtol=1e-5)
 
 
 if __name__ == '__main__':

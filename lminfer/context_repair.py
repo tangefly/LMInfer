@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from transformers import DynamicCache
 
 from .kvcache import rebase_rope_cache, slice_cache
+from .model_adapters import resolve_logits_kwargs
 
 
 @dataclass
@@ -126,8 +127,11 @@ def _select(scores, grafts, options, base_len, n):
 @torch.inference_mode()
 def exact_prefill(model, input_ids, prefix, base_len, reason=None):
     cache = slice_cache(prefix, base_len, model.config) if base_len else DynamicCache(config=model.config)
+    # 只要末尾 logits: 整段重算(以及所有 MoE/非 dense Qwen3 的回退路径)都走这里,
+    # 大词表模型长 prompt 下全位置 logits 是 GiB 级的临时张量(见 resolve_logits_kwargs)
     out = model(input_ids=input_ids[:, base_len:], past_key_values=cache,
-                attention_mask=torch.ones_like(input_ids), use_cache=True)
+                attention_mask=torch.ones_like(input_ids), use_cache=True,
+                **resolve_logits_kwargs(model))
     return RepairOutput(out.logits[:, -1:], cache, input_ids.shape[1],
                         {"fallback_reason": reason, "exact": True})
 

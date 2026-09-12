@@ -28,8 +28,11 @@ model_type 或 tokenizer 的特殊 token 自动识别), 显式指定
 本模块同时承载"模型怎么加载"的差异(load_text_model): 多模态包装(如
 Mistral3ForConditionalGeneration)只取文本解码器, fine-grained FP8 权重在
 transformers 后端反量化成普通线性层。这两件事都是模型家族知识, 不应散落在引擎里。
+"前向要传哪些参数"同理(resolve_logits_kwargs): 只算末尾位置的 logits, 是 30B 级
+权重 + 长 prompt 下不被临时张量顶爆显存的前提。
 """
 
+import inspect
 import logging
 from dataclasses import dataclass
 
@@ -308,6 +311,23 @@ def resolve_rotary_emb(model):
         if name.endswith("rotary_emb"):
             return module
     return None
+
+
+def resolve_logits_kwargs(model) -> dict:
+    """前向时只计算末尾位置的 logits(transformers 5.x 的 `logits_to_keep=1`).
+
+    引擎的 prefill/decode 与精确修复(`context_repair.exact_prefill`)都只取
+    `out.logits[:, -1]`, 但默认实现会为**所有**位置算 logits —— 30B 级模型
+    (Qwen3-30B-A3B 词表 151936)在 40K prompt 下那是
+    `40960 x 151936 x 2B ≈ 11.6 GiB` 的临时张量, 与 58 GiB 权重叠加直接 OOM。
+    只在 forward 签名真的支持该参数时传(多模态包装/自定义模型不支持就保持原行为)。
+    """
+    try:
+        if "logits_to_keep" in inspect.signature(model.forward).parameters:
+            return {"logits_to_keep": 1}
+    except (TypeError, ValueError):  # 拿不到签名的包装模型: 保持默认行为
+        pass
+    return {}
 
 
 def _is_finegrained_fp8(config) -> bool:

@@ -597,5 +597,67 @@ class Glm4RopeRebaseTest(unittest.TestCase):
         self.assertGreater(float((wrong - at_target).abs().max()), 1.0)
 
 
+class Qwen3MoeRopeRebaseTest(unittest.TestCase):
+    """用 Qwen3-MoE 真实的 RoPE 模块验证 rebase 相位(不需要权重).
+
+    Qwen3-30B-A3B-Instruct-2507 的注意力与 dense Qwen3 同布局(全 head_dim 旋转、
+    前后对半配对), 但模块是 `Qwen3MoeRotaryEmbedding`、theta 是 1e7。拼接模式的
+    `--graft-rope-rebase` 必须用这个模块的逆频率, 且布局判定不能把它当成 GLM 式
+    交错旋转 —— 这个用例是那次适配的回归测试。
+    """
+
+    SOURCE, TARGET, LENGTH, HEAD_DIM = 1200, 2400, 6, 128
+
+    @staticmethod
+    def _config():
+        # head_dim 要显式给(默认配置里是 None, 会按 hidden/heads 算出 64);
+        # rope_theta 换成 checkpoint 的 1e7 才与真实模型一致
+        from transformers import Qwen3MoeConfig
+        config = Qwen3MoeConfig(head_dim=Qwen3MoeRopeRebaseTest.HEAD_DIM)
+        config.rope_parameters["rope_theta"] = 10000000.0
+        return config
+
+    @staticmethod
+    def _rope():
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRotaryEmbedding
+        return Qwen3MoeRotaryEmbedding(Qwen3MoeRopeRebaseTest._config())
+
+    def _keys_at(self, rope, keys, position):
+        """按模型自己的 RoPE 在给定绝对位置旋转 K(ground truth)."""
+        positions = torch.full((1, keys.shape[-2]), position)
+        return _rotate(keys, *rope(keys, positions))
+
+    def _cache(self, keys):
+        return DynamicCache(ddp_cache_data=[(keys.clone(), keys.clone())], config=None)
+
+    def test_rebase_matches_model_rope_at_target_position(self):
+        rope, config = self._rope(), self._config()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+        at_target = self._keys_at(rope, keys, self.TARGET)
+
+        rebased = rebase_rope_cache(self._cache(at_source), self.SOURCE, self.TARGET,
+                                    config, rope=rope)
+
+        torch.testing.assert_close(rebased.layers[0].keys, at_target,
+                                   atol=1e-5, rtol=1e-5)
+
+    def test_plain_fallback_matches_full_dim_half_split(self):
+        # 没有可调用 RoPE 模块时的默认公式: Qwen3-MoE 是 full-dim + half-split,
+        # rope_type=default(无缩放), 两者数值应当一致
+        rope, config = self._rope(), self._config()
+        torch.manual_seed(0)
+        keys = torch.randn(1, 1, self.LENGTH, self.HEAD_DIM)
+        at_source = self._keys_at(rope, keys, self.SOURCE)
+        at_target = self._keys_at(rope, keys, self.TARGET)
+
+        rebased = rebase_rope_cache(self._cache(at_source), self.SOURCE, self.TARGET,
+                                    config, rope=None)
+
+        torch.testing.assert_close(rebased.layers[0].keys, at_target,
+                                   atol=1e-5, rtol=1e-5)
+
+
 if __name__ == "__main__":
     unittest.main()
