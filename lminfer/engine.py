@@ -35,7 +35,8 @@ from transformers import (
 )
 
 from .config import EngineConfig, SamplingParams
-from .model_adapters import load_text_model, resolve_logits_kwargs, resolve_rotary_emb
+from .model_adapters import (kv_bytes_per_token, load_text_model,
+                             resolve_logits_kwargs, resolve_rotary_emb)
 from .repair import repair_token_counts
 from .context_repair import context_prefill, exact_prefill
 from .kvcache import (
@@ -200,15 +201,12 @@ class LLMEngine:
     def kv_bytes_per_token(self) -> int:
         """每生成 1 个 token, 全部层新增 K+V 的显存字节数.
 
-        公式: 2(K 和 V) x 层数 x KV头数 x head_dim x 每元素字节数
-        这是理解 KV cache 内存开销的关键数字.
+        公式按模型家族取(见 model_adapters.kv_bytes_per_token): 普通 GQA/MHA 是
+        2(K+V) x 层数 x KV头数 x head_dim x 每元素字节数; MLA(如 GLM-4.7-Flash)
+        缓存的是压缩潜向量 kv_lora_rank + qk_rope_head_dim, 与 KV 头数无关。
         """
-        c = self.model_config
-        num_layers = c.num_hidden_layers
-        num_kv_heads = getattr(c, "num_key_value_heads", None) or c.num_attention_heads
-        head_dim = getattr(c, "head_dim", None) or (c.hidden_size // c.num_attention_heads)
         dtype_size = torch.tensor([], dtype=self.model.dtype).element_size()
-        return 2 * num_layers * num_kv_heads * head_dim * dtype_size
+        return kv_bytes_per_token(self.model_config, dtype_size)
 
     def _eos_ids(self) -> set[int]:
         """收集所有需要触发停止的 eos token id.

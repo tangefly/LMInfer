@@ -9,6 +9,7 @@ from lminfer.kvcache import (
     TOOL_RESPONSE_CLOSE,
     TOOL_RESPONSE_OPEN,
     SessionKVStore,
+    _rope_delta_cos_sin,
     rebase_rope_cache,
 )
 
@@ -595,6 +596,93 @@ class Glm4RopeRebaseTest(unittest.TestCase):
         wrong = _rotate(at_source, emb.cos()[None], emb.sin()[None])
 
         self.assertGreater(float((wrong - at_target).abs().max()), 1.0)
+
+
+class Glm4MoeLiteRopeRebaseTest(unittest.TestCase):
+    """用 GLM-4.7-Flash 真实的 MLA RoPE 模块验证 rebase 相位(不需要权重).
+
+    这一系的 KV cache 存的不是展开后的 K/V, 而是压缩潜向量:
+    `layer.keys = kv_nope [b, 1, s, kv_lora_rank]`(位置无关) +
+    `layer.values = k_rot [b, 1, s, qk_rope_head_dim]`(**唯一带位置的张量**, 由
+    `apply_rotary_pos_emb_interleave` 在写入缓存前旋转)。所以位置重映射必须转
+    value 槽、且用奇偶交错配对 —— 旧的"转 key 槽 + 前后对半"实现转的是位置无关的
+    潜向量, 真正该转的张量纹丝不动(静默算错, 不报任何错)。
+    """
+
+    SOURCE, TARGET, LENGTH = 1200, 2400, 6
+    LATENT_DIM, ROTARY_DIM = 64, 32   # 缩小版 kv_lora_rank / qk_rope_head_dim
+
+    @classmethod
+    def _config(cls):
+        from transformers import Glm4MoeLiteConfig
+        return Glm4MoeLiteConfig(qk_rope_head_dim=cls.ROTARY_DIM,
+                                 kv_lora_rank=cls.LATENT_DIM,
+                                 rope_parameters={"rope_theta": 10000.0,
+                                                  "rope_type": "default"})
+
+    @classmethod
+    def _rope(cls):
+        from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+            Glm4MoeLiteRotaryEmbedding,
+        )
+        return Glm4MoeLiteRotaryEmbedding(cls._config())
+
+    @staticmethod
+    def _values_at(rope, values, position):
+        """按模型自己的 apply_rotary_pos_emb_interleave 旋转 k_rot(ground truth)."""
+        from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+            apply_rotary_pos_emb_interleave,
+        )
+        positions = torch.full((1, values.shape[-2]), position)
+        cos, sin = rope(values, positions)
+        _, k_emb = apply_rotary_pos_emb_interleave(values, values, cos, sin)
+        return k_emb
+
+    def _cache(self, keys, values):
+        """MLA 形态的缓存: key 槽是潜向量, value 槽是已旋转的 k_rot."""
+        return DynamicCache(ddp_cache_data=[(keys.clone(), values.clone())],
+                            config=None)
+
+    def test_rebase_rotates_the_value_slot_to_the_target_position(self):
+        rope, config = self._rope(), self._config()
+        torch.manual_seed(0)
+        latent = torch.randn(1, 1, self.LENGTH, self.LATENT_DIM)
+        values = torch.randn(1, 1, self.LENGTH, self.ROTARY_DIM)
+        at_source = self._values_at(rope, values, self.SOURCE)
+        at_target = self._values_at(rope, values, self.TARGET)
+
+        rebased = rebase_rope_cache(self._cache(latent, at_source),
+                                    self.SOURCE, self.TARGET, config, rope=rope)
+
+        torch.testing.assert_close(rebased.layers[0].values, at_target,
+                                   atol=1e-5, rtol=1e-5)
+
+    def test_position_independent_latent_is_untouched(self):
+        # 潜向量不参与旋转: rebase 必须逐位保留(它本来就不随位置变)
+        rope, config = self._rope(), self._config()
+        torch.manual_seed(0)
+        latent = torch.randn(1, 1, self.LENGTH, self.LATENT_DIM)
+        values = torch.randn(1, 1, self.LENGTH, self.ROTARY_DIM)
+        at_source = self._values_at(rope, values, self.SOURCE)
+
+        rebased = rebase_rope_cache(self._cache(latent, at_source),
+                                    self.SOURCE, self.TARGET, config, rope=rope)
+
+        torch.testing.assert_close(rebased.layers[0].keys, latent)
+
+    def test_half_split_pairing_would_be_wrong(self):
+        # 奇偶交错 vs 前后对半是两组不同的配对, 偏差是 k_rot 自身的量级:
+        # 回归保护 —— 布局标志(interleaved)必须由 config.rope_interleave 决定
+        rope, config = self._rope(), self._config()
+        torch.manual_seed(0)
+        values = torch.randn(1, 1, self.LENGTH, self.ROTARY_DIM)
+        at_target = self._values_at(rope, values, self.TARGET)
+        cos, sin = _rope_delta_cos_sin(self.LENGTH, self.TARGET - self.SOURCE,
+                                       self.ROTARY_DIM, config, values.device,
+                                       values.dtype, rope)
+        wrong = _rotate(values, cos[None, None], sin[None, None])
+
+        self.assertGreater(float((wrong - at_target).abs().max()), 0.5)
 
 
 class Qwen3MoeRopeRebaseTest(unittest.TestCase):

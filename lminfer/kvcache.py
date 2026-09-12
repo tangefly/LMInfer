@@ -266,13 +266,16 @@ def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
 
 def rebase_rope_cache(cache: DynamicCache, source_start: int, target_start: int,
                       config, rope=None) -> DynamicCache:
-    """Deep-copy `cache` and rebase K RoPE positions from source to target.
+    """Deep-copy `cache` and rebase the RoPE'd tensor's positions source->target.
 
-    Only K carries RoPE; V is cloned unchanged. This corrects position mismatch
-    for grafted sub-agent output KV, but it does not fix the different-context
-    hidden-state gap. `rope` is the model's own rotary-embedding module: passing
-    it makes the rebase exact for scaled RoPE variants (e.g. Ministral-3's YaRN),
-    see _rope_delta_cos_sin.
+    Only the slot that carries RoPE is rotated (the other is cloned unchanged):
+    for ordinary GQA/MHA that is K, but MLA (GLM-4.7-Flash) caches the rotated
+    shared key `k_rot` in the **value** slot and the position-independent
+    compressed latent in the key slot —— see RopeLayout.rotated_slot. This
+    corrects position mismatch for grafted sub-agent output KV, but it does not
+    fix the different-context hidden-state gap. `rope` is the model's own
+    rotary-embedding module: passing it makes the rebase exact for scaled RoPE
+    variants (e.g. Ministral-3's YaRN), see _rope_delta_cos_sin.
 
     Rotation is applied only to the first `rotary_dim` dims and the layout's own
     rotate_half is used, so partial/interleaved RoPE (GLM-4: 64 of 128 dims,
@@ -289,23 +292,27 @@ def rebase_rope_cache(cache: DynamicCache, source_start: int, target_start: int,
     for layer in cache.layers:
         keys = layer.keys.clone()
         values = layer.values.clone()
-        length = keys.shape[-2]
-        head_dim = keys.shape[-1]
-        layout = resolve_rope_layout(config, head_dim)
+        # 先按家族定布局(MLA 把旋转键放在 value 槽), 再取"要旋转的那个张量":
+        # 它的最后一维才是布局认的 head_dim(MLA 的 key 槽宽度是潜向量 512, 与
+        # RoPE 无关)。
+        layout = resolve_rope_layout(config, keys.shape[-1])
+        target = values if layout.rotated_slot == "values" else keys
+        length = target.shape[-2]
+        head_dim = target.shape[-1]
         cos, sin = _rope_delta_cos_sin(length, delta, head_dim, config,
-                                       keys.device, keys.dtype, rope)
+                                       target.device, target.dtype, rope)
         cos = cos[None, None, :, :]
         sin = sin[None, None, :, :]
+        rotate = (_rotate_half_interleaved if layout.interleaved else _rotate_half)
         rotary = layout.rotary_dim
         if rotary < head_dim:
-            keys_rot, keys_pass = keys[..., :rotary], keys[..., rotary:]
-            rotate = (_rotate_half_interleaved if layout.interleaved else _rotate_half)
-            keys_rot = (keys_rot * cos) + (rotate(keys_rot) * sin)
-            keys = torch.cat([keys_rot, keys_pass], dim=-1)
+            target_rot, target_pass = target[..., :rotary], target[..., rotary:]
+            target_rot = (target_rot * cos) + (rotate(target_rot) * sin)
+            target = torch.cat([target_rot, target_pass], dim=-1)
         else:
-            rotate = (_rotate_half_interleaved if layout.interleaved else _rotate_half)
-            keys = (keys * cos) + (rotate(keys) * sin)
-        layers.append((keys, values))
+            target = (target * cos) + (rotate(target) * sin)
+        layers.append((keys, target) if layout.rotated_slot == "values"
+                      else (target, values))
     return DynamicCache(ddp_cache_data=layers, config=config)
 
 

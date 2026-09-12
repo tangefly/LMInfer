@@ -29,6 +29,10 @@ class EngineConfig:
                                     # 解析 Llama 3.x 的 {"name":...,"parameters":...} JSON;
                                     # mistral: 解析 [TOOL_CALLS]name[ARGS]{json};
                                     # glm4: 解析 GLM-4 的 name\n{json};
+                                    # glm4_moe: 解析 GLM-4.5/4.6/4.7 的
+                                    #   <tool_call>name<arg_key>k</arg_key><arg_value>v
+                                    #   </arg_value></tool_call>(别名 glm45/glm47 同义,
+                                    #   与 vLLM 的 --tool-call-parser 名字对齐);
                                     # none: 关闭解析. auto 按 config.model_type/tokenizer
                                     # 自动识别(见 model_adapters.py, 对应 vLLM 的
                                     # --tool-call-parser)

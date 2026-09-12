@@ -82,6 +82,15 @@ lminfer serve /home/tanger/workspace/models/GLM-4-9B-0414 \
     --repair-window-begin 0.1 --repair-window-end 0.1 \
     --enable-auto-tool-choice --port 8000
 
+# GLM-4.7 系 MoE / GLM-4.7-Flash(工具调用 <tool_call>name<arg_key>k...
+# 即 vLLM 的 glm45/glm47; MLA 注意力; 权重约 59 GiB, 单卡 80GB)
+lminfer serve /public/home/xiaoxunpeng/Models/GLM-4.7-Flash \
+    --served-model-name GLM-4.7-Flash --max-model-len 40960 \
+    --reuse-agent-kv-append --graft-rope-rebase \
+    --repair-window-begin 0.1 --repair-window-end 0.1 \
+    --no-enable-thinking \
+    --enable-auto-tool-choice --port 8000
+
 # Qwen3 MoE / Qwen3-30B-A3B-Instruct-2507(协议与 dense Qwen3 相同; 权重约 58 GiB, 单卡 80GB)
 lminfer serve /public/home/xiaoxunpeng/Models/Qwen3-30B-A3B-Instruct-2507 \
     --served-model-name Qwen3-30B-A3B-Instruct-2507 --max-model-len 40960 \
@@ -164,8 +173,17 @@ lminfer serve /path/to/model --enable-auto-tool-choice                          
     `函数名\n{json}`（函数名独占一行、紧跟一个 JSON 参数对象，前面可能带字面量
     `<|assistant|>`，以 `<|observation|>` / `<|user|>` 结束），对应 vLLM 的
     `--tool-call-parser glm4`；
+  - GLM-4.5/4.6/4.7 系 MoE（`config.model_type` 为 `glm4_moe` / `glm4_moe_lite`，如
+    GLM-4.7-Flash）走 `glm4_moe`：解析输出里的
+    `<tool_call>函数名<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+    （函数名后可直接跟第一个 `<arg_key>`，也可无参数；参数值按原始文本作为字符串返回），
+    对应 vLLM 的 `--tool-call-parser glm45` / `glm47` —— 两个名字在本仓库是
+    `glm4_moe` 的**别名**，从 vLLM 命令直接抄过来即可。注意这一系的 tokenizer 里
+    `<tool_call>` 本身是单特殊 token，`auto` 是按 `config.model_type` 抢在 token
+    探测之前判定的（否则会被 hermes 认走、把 XML 块当 JSON 解析失败后整段删掉）；
   - 都没有则 `none` 关闭解析，输出按普通文本返回。
-  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `mistral` / `glm4` / `none` 强制使用某
+  也可以显式指定 `hermes` / `qwen` / `llama3_json` / `mistral` / `glm4` / `glm4_moe`
+  （别名 `glm45` / `glm47`）/ `none` 强制使用某
   解析器，但注意 **每个解析器只认自己那套标记**：
   给 Llama 3.x 模型配 `hermes`（或反之）会解析不到任何工具调用，工具调用文本会
   整段漏进 `content`、客户端拿不到 `tool_calls`。为避免这类静默失效，显式配置与
@@ -279,6 +297,46 @@ Llama 3.1/3.2/3.3 系的工具调用协议与 Qwen 完全不同，适配层做�
    多个调用拆成多条消息（与模型卡 README 的处理一致）；agent 场景本来就要求一次一个。
 
 完整的适配清单、启动命令与实测日志见 [GLM-4 适配记录](docs/glm4.md)。
+
+**GLM-4.7-Flash（glm4_moe_lite，MLA + MoE）**
+
+差异在**两个互不相干的轴上**：工具调用是 XML 协议（同族但不同于 GLM-4-0414），
+注意力是 **MLA**（压缩潜向量缓存）。
+
+1. **工具调用**（`glm4_moe` 解析器）：输出
+   `<tool_call>函数名<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+   （无参数时函数名后直接 `</tool_call>`；参数值是标签之间的原始文本，**一律按字符串
+   返回**，与 vLLM 的 glm47 一致）。对应 vLLM 的 `--tool-call-parser glm45`/`glm47`，
+   两个名字在本仓库是别名。`config.model_type` 是这里的权威信号：`<tool_call>` 在这
+   一系的 tokenizer 里是**单特殊 token**，按 token 探测会先命中 hermes —— 而 hermes
+   对 XML 块 `json.loads` 必然失败，块会被 cleaner 整段删掉（content 里连原文都不剩），
+   且 `parser == native` 连兜底回退都不触发，客户端只看到空回复；
+2. **模板原生认 OpenAI 的 `tool_calls` / `tool` 角色**（与 GLM-4-0414 相反，不需要
+   metadata/observation 翻译），但 arguments 必须是**对象**：模板写
+   `{% for k, v in tc.arguments.items() %}`，传 JSON 字符串会抛 `UndefinedError` →
+   每轮 400。因此本家族的 `arguments_as_dict=True`（与 Llama 3.x 同一处适配）；
+   另外 assistant 消息 `content=null`（OpenAI 协议里工具调用消息就是这样）会在模板里
+   渲染出字面量 `None`，服务端在"带 tool_calls 的 assistant 消息"上归一成空串；
+3. **MLA 的 KV cache 布局**：`layer.keys` 是位置无关的压缩潜向量
+   （`kv_lora_rank=512`），`layer.values` 才是唯一带位置的 `k_rot`
+   （`qk_rope_head_dim=64`）。`--graft-rope-rebase` 因此按 `RopeLayout.rotated_slot`
+   选要旋转的张量（value 槽），另一槽逐位 clone —— 旧实现只转 key 槽，对本模型转的是
+   位置无关的潜向量，真正该转的纹丝不动（静默算错，不抛异常）；
+4. **缓存的配对是"前后对半"，不能照 `config.rope_interleave` 判**：那个标志描述的是
+   模型读入的原始 `k_rot` 里复数是 (2i, 2i+1) 排列，而它的
+   `apply_rotary_pos_emb_interleave` 在写缓存**之前**已把配对重排成前后对半。
+   实测：按缓存的配对做 delta 旋转与"直接在目标位置旋转"相差 2.38e-07，
+   用交错式则偏差 4.49（`k_rot` 的量级是 3.10）。同理，`rotary_dim` 取
+   `qk_rope_head_dim`，而不是传进来的 key 槽宽度 512；
+5. **每 token KV 只有 0.05 MiB**：MLA 缓存压缩潜向量，通用公式
+   （`2 × 层数 × KV头数 × head_dim`）会高估 4.4 倍；`kv_bytes_per_token` 按
+   `(kv_lora_rank + qk_rope_head_dim) × 层数 × dtype` 计算（与 KV 头数无关）；
+6. **thinking 默认开**（模板缺省以 `<think>` 结尾，与 Qwen3 的约定相反）：开启时输出
+   以裸推理正文开头，回填剥 think 后 LCP 前缀变短，agent 场景推荐
+   `--no-enable-thinking`（关掉后 round-trip 逐位全等：215 prompt + 24 生成 = 239 tok
+   整段命中）。MoE 部分（64 路由专家 + 1 共享，top-4）与 Qwen3-MoE 一样不需要额外适配。
+
+完整的适配清单、启动命令与实测日志见 [GLM-4.7-Flash 适配记录](docs/glm47.md)。
 
 **Qwen3-MoE 系（Qwen3-30B-A3B-Instruct-2507 实测）**
 
@@ -460,7 +518,8 @@ lminfer serve /path/to/model --reuse-agent-kv-append
               LCP 复用  prefill   ↑ graft    prefill   ↑ graft    prefill
 ```
 
-- **锚点**：包裹标记由 tokenizer 探测得到（Qwen3 是 `<tool_response>`，Mistral 是
+- **锚点**：包裹标记由 tokenizer 探测得到（Qwen3 与 GLM-4.7-Flash 是
+  `<tool_response>`，Mistral 是
   `[TOOL_RESULTS]`，GLM-4 是 `<|observation|>` + 下一个角色标记，见
   `TOOL_RESULT_WRAPPERS`），标记都必须是单个特殊 token；
   探测不到时拼接模式自动不可用（启动日志会说明），退化为 LCP 复用。子输出是
@@ -506,8 +565,10 @@ KV 首尾的重计算比例。例如匹配到 100 token 时，首部重算 15 �
 main 历史仍按 LCP 精确复用，定位失败时自动回退到 LCP 行为，因此单独开
 `--reuse-agent-kv-append` 即可同时获得两者收益。
 
-`--graft-rope-rebase` 在插入前把子输出 K 从子上下文位置重映射到 main prompt
-的插入位置。它使用**模型文本塔自己的 RoPE 逆频率**（见
+`--graft-rope-rebase` 在插入前把子输出里**带位置的那个张量**从子上下文位置重映射到
+main prompt 的插入位置（普通注意力是 K；MLA 如 GLM-4.7-Flash 是缓存 value 槽里的
+`k_rot`，位置无关的压缩潜向量逐位 clone，见
+`RopeLayout.rotated_slot`）。它使用**模型文本塔自己的 RoPE 逆频率**（见
 [模型适配](#模型适配qwen--qwen3-moe--llama--mistral--glm-4--多模态--fp8) 第 7 条），因此对
 YaRN / Llama-3 / dynamic 等缩放型 RoPE 同样正确；只修正位置差，不修正上下文差。
 模型没有可用的 RoPE 模块时按默认公式回退并打印 WARNING。
@@ -560,6 +621,11 @@ Q/K/V 再与缓存的 K/V 做 attention：
 例如 Qwen2.5-7B-Instruct（28 层，4 个 KV 头，head_dim 128，bf16）：
 `2 × 28 × 4 × 128 × 2 = 57344 B ≈ 56 KiB/token`，32K 上下文就需要约 1.75 GiB。
 这就是 vLLM 用 PagedAttention 管理显存、以及 KV cache 量化/压缩成为研究方向的原因。
+
+MLA 模型（如 GLM-4.7-Flash）缓存的是压缩潜向量，公式换成
+`(kv_lora_rank + qk_rope_head_dim) × 层数 × 每元素字节数`（与 KV 头数无关，
+47 层 512/64 维 bf16 约 0.05 MiB/token）；服务启动时打印的理论值按模型家族选公式
+（见 `model_adapters.kv_bytes_per_token`）。
 
 ### 动手实验
 

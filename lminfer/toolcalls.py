@@ -17,6 +17,14 @@ Mistral v11+ 系(Ministral 3 等)输出(见 vLLM 的 mistral parser):
 (每个都以 `[TOOL_CALLS]` 开头)。v11 tokenizer 会在 name 与 `[ARGS]` 之间插入
 `[CALL_ID]<id>`, v13 不再插入(本机 Ministral-3 是 v13)。
 
+GLM-4.5/4.6/4.7 系 MoE(glm4_moe / glm4_moe_lite, 见 vLLM 的 glm45/glm47 parser)
+输出 XML 形态的工具调用:
+
+    <tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value></tool_call>
+
+函数名直接跟在 `<tool_call>` 后, 参数按 `<arg_key>`/`<arg_value>` 成对出现,
+值是标签之间的原始文本(按字符串返回, 不做 JSON 反序列化)。
+
 <tool_call> 等是模型的特殊 token, 生成时需要用 skip_special_tokens=False 解码,
 解析成功后转成 OpenAI 的 tool_calls 字段(与 /v1/chat/completions 响应格式一致).
 """
@@ -277,6 +285,12 @@ class ToolCallStreamSplitter:
         self._buf = self._buf[start + len(marker):]
         self._state = state
 
+    def _parse_block(self, block: str) -> Dict[str, Any] | None:
+        """解析一个完整的 <tool_call> 块体(子类按自己的协议覆写, 见
+        Glm4MoeStreamSplitter: 同样的标记, 块体是 XML 参数而不是 JSON)。
+        """
+        return _parse_call_block(block)
+
     def push(self, chunk: str) -> List[Tuple[str, Any]]:
         events: List[Tuple[str, Any]] = []
         self._buf += chunk
@@ -285,7 +299,7 @@ class ToolCallStreamSplitter:
                 end = self._buf.find(TOOL_CALL_END)
                 if end == -1:
                     break  # 未闭合: 继续攒缓冲, 不提前输出
-                call = _parse_call_block(self._buf[:end])
+                call = self._parse_block(self._buf[:end])
                 if call is not None:
                     events.append(("tool_call", call))
                 self._buf = self._buf[end + len(TOOL_CALL_END):]
@@ -974,6 +988,93 @@ class Glm4StreamSplitter:
 
 
 # ---------------------------------------------------------------------------
+# GLM-4.5/4.6/4.7 MoE 工具调用(<tool_call>name<arg_key>k</arg_key><arg_value>v)
+# ---------------------------------------------------------------------------
+
+# GLM-4.5/4.6/4.7 系 MoE(config.model_type = glm4_moe / glm4_moe_lite)的工具调用
+# 是 XML 形态, 与 GLM-4-0414 的 `name\n{json}` 完全不同, 因此单独一套解析器
+# (vLLM 也是分开注册的: glm45/glm47 → glm47_moe parser):
+#
+#   <tool_call>get_weather<arg_key>city</arg_key><arg_value>北京</arg_value></tool_call>
+#
+# - 函数名直接跟在 <tool_call> 后(可无参数: 名字后面就是 </tool_call>);
+# - 参数按 <arg_key>/<arg_value> 成对出现, 值是标签之间的**原始文本**;
+# - 参数值不做 JSON 反序列化, 一律按字符串返回(与 vLLM 的 glm47 一致):
+#   GLM-4.7 的模板对字符串参数原样渲染、只对非字符串才 `| tojson`, 保留原始文本
+#   才能让客户端回填后的 prompt 与模型生成流逐位一致 —— 跨请求 KV 前缀要覆盖
+#   工具调用回合, 靠的就是这一点(实测 round-trip 逐位全等)。
+GLM4_MOE_CALL_BLOCK = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+GLM4_MOE_ARG = re.compile(
+    r"<arg_key>(?P<key>.*?)</arg_key>\s*"
+    r"<arg_value>(?P<value>.*?)</arg_value>",
+    re.DOTALL,
+)
+
+
+def _glm4_moe_block_name(block: str) -> str:
+    """从一个 <tool_call> 块体里取函数名(用于按 schema 查参数; 取不到返回空串)."""
+    first = GLM4_MOE_ARG.search(block)
+    return (block[:first.start()] if first is not None else block).strip()
+
+
+def _glm4_moe_call(block: str, schema: dict | None = None) -> Dict[str, Any] | None:
+    """一个 <tool_call> 块体 -> OpenAI 格式工具调用; 函数名为空返回 None.
+
+    schema 只用于把"字符串形式的列表"参数还原成真正的数组(见 _repair_array_args,
+    与 hermes/mistral/glm4 一致的修复): 修复动了参数才会改变 arguments 的形态,
+    不动时逐位保留原始值。
+    """
+    name = _glm4_moe_block_name(block)
+    if not name:
+        return None
+    args: Dict[str, Any] = {}
+    for match in GLM4_MOE_ARG.finditer(block):
+        key = match.group("key").strip()
+        if key:
+            args[key] = match.group("value")
+    _repair_array_args(args, schema)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:16]}",
+        "type": "function",
+        "function": {"name": name,
+                     "arguments": json.dumps(args, ensure_ascii=False)},
+    }
+
+
+def parse_glm4_moe_tool_calls(text: str,
+                              schemas: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    """扫描可见输出, 提取 GLM-4.5/4.6/4.7 的 <tool_call>name<arg_key>... 调用.
+
+    schemas: 函数名 -> parameters schema, 供 _repair_array_args 修复"字符串形式的
+    列表"参数; 为 None 时不做修复(原样返回模型输出的值)。
+    """
+    text = THINK_BLOCK.sub("", text)
+    calls: List[Dict[str, Any]] = []
+    for block in GLM4_MOE_CALL_BLOCK.findall(text):
+        call = _glm4_moe_call(block, (schemas or {}).get(_glm4_moe_block_name(block)))
+        if call is not None:
+            calls.append(call)
+    return calls
+
+
+def clean_glm4_moe_content(text: str) -> str:
+    """去掉 <tool_call> 块与 think 块, 只返回可进入对话历史的内容."""
+    text = GLM4_MOE_CALL_BLOCK.sub("", text)
+    text = THINK_BLOCK.sub("", text)
+    return text.strip()
+
+
+class Glm4MoeStreamSplitter(ToolCallStreamSplitter):
+    """GLM-4.5/4.6/4.7 的流式切分器: 切分逻辑与 hermes 完全一致(<tool_call> 与
+    </tool_call> 都是单特殊 token), 只是块体是 XML 参数而不是 JSON —— 覆写块解析
+    即可(见 ToolCallStreamSplitter._parse_block)。
+    """
+
+    def _parse_block(self, block: str) -> Dict[str, Any] | None:
+        return _glm4_moe_call(block)
+
+
+# ---------------------------------------------------------------------------
 # 解析器分派与协议冲突回退(server 用)
 # ---------------------------------------------------------------------------
 
@@ -990,6 +1091,8 @@ def parse_output_tool_calls(text: str, parser: str,
         return parse_mistral_tool_calls(text, schemas)
     if parser == "glm4":
         return parse_glm4_tool_calls(text, schemas)
+    if parser == "glm4_moe":
+        return parse_glm4_moe_tool_calls(text, schemas)
     return parse_tool_calls(text, schemas)
 
 
@@ -1001,6 +1104,8 @@ def clean_output_content(text: str, parser: str) -> str:
         return clean_mistral_content(text)
     if parser == "glm4":
         return clean_glm4_content(text)
+    if parser == "glm4_moe":
+        return clean_glm4_moe_content(text)
     return clean_content(text)
 
 
@@ -1016,12 +1121,15 @@ def make_stream_splitter(parser: str, tool_names=None):
         return MistralStreamSplitter()
     if parser == "glm4":
         return Glm4StreamSplitter(tool_names)
+    if parser == "glm4_moe":
+        return Glm4MoeStreamSplitter()
     return ToolCallStreamSplitter()
 
 
 # 各流式切分器都实现同一组 push/flush 接口, 供 server 的类型标注使用
 StreamSplitter = (ToolCallStreamSplitter | LlamaJsonStreamSplitter
-                  | MistralStreamSplitter | Glm4StreamSplitter)
+                  | MistralStreamSplitter | Glm4StreamSplitter
+                  | Glm4MoeStreamSplitter)
 
 
 def clean_tool_call_prefix(text: str, parser: str,
@@ -1044,8 +1152,9 @@ def clean_tool_call_prefix(text: str, parser: str,
 #   hermes/qwen: content = 第一个 <tool_call> 之前的正文;
 #   mistral    : content = 第一个 [TOOL_CALLS] 之前的正文;
 #   glm4       : content = 第一个 "name\n{json}" 之前的正文;
+#   glm4_moe   : content = 第一个 <tool_call> 之前的正文(XML 块有起止标记);
 #   llama3_json: 返回 null(JSON 调用本身就是整条消息)。
-_KEEP_PREFIX_CONTENT = ("hermes", "qwen", "mistral", "glm4")
+_KEEP_PREFIX_CONTENT = ("hermes", "qwen", "mistral", "glm4", "glm4_moe")
 
 
 def parse_model_output(text: str, parser: str, fallback_parser: str | None,

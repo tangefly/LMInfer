@@ -62,13 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
                               "加载期反量化成模型 dtype(纯 transformers 前向, KV 切片/RoPE rebase "
                               "保持同一种 dtype). 缺省自动: 未安装 kernels 包(FP8 前向内核)就反量化; "
                               "--no-dequantize-fp8 强制保留 FP8(需要 kernels 包, 否则前向报错)")
-    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "llama3_json", "mistral", "glm4", "none"], default=None,
+    p_serve.add_argument("--tool-call-parser", choices=["auto", "qwen", "hermes", "llama3_json", "mistral", "glm4", "glm4_moe", "glm45", "glm47", "none"], default=None,
                          help="工具调用解析: auto 自动识别模型家族(Qwen/Hermes 系解析 "
-                              "<tool_call> 块, Llama 3.x 系解析 {\"name\":...,\"parameters\":...} "
-                              "JSON, Mistral 系解析 [TOOL_CALLS]name[ARGS]{json}, GLM-4 系解析 "
-                              "name\\n{json}); qwen/hermes 强制块解析; llama3_json / mistral / "
-                              "glm4 强制对应协议; none 关闭. 默认 auto. 显式指定与模型家族冲突时"
-                              "(如 Llama 3.x 配 hermes), 启动告警并按模型原生协议兜底解析")
+                              "<tool_call>{\"name\":...} JSON 块, Llama 3.x 系解析 "
+                              "{\"name\":...,\"parameters\":...} JSON, Mistral 系解析 "
+                              "[TOOL_CALLS]name[ARGS]{json}, GLM-4 系解析 name\\n{json}, "
+                              "GLM-4.5/4.6/4.7 系解析 <tool_call>name<arg_key>k</arg_key>"
+                              "<arg_value>v</arg_value> XML 块); qwen/hermes 强制块解析; "
+                              "llama3_json / mistral / glm4 / glm4_moe 强制对应协议; "
+                              "glm45/glm47 是 glm4_moe 的 vLLM 兼容别名; none 关闭. 默认 auto. "
+                              "显式指定与模型家族冲突时(如 Llama 3.x 配 hermes), 启动告警并按"
+                              "模型原生协议兜底解析")
     p_serve.add_argument("--enable-auto-tool-choice", action="store_true",
                          help="请求带 tools 且未显式给 tool_choice 时默认按 auto 处理"
                               "(不开启时默认 none, 忽略 tools; 与 vLLM 语义一致)")

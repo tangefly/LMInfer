@@ -82,6 +82,72 @@ def adapt_glm4_messages(messages: list, strip_assistant_think: bool = True) -> l
     return out
 
 
+def adapt_openai_messages(messages: list, profile, strip_assistant_think: bool = True) -> list[dict]:
+    """OpenAI 消息 -> 模板可渲染的纯 dict(模板自己认 OpenAI 字段的家族走这里).
+
+    模板里既可能写 message['role'] 也可能写 message.role(jinja 的 `.` 对 dict 会
+    回退到下标访问, 对 pydantic 对象则只支持属性访问), 统一转 dict 才能适配任意
+    模板; tool_calls / tool_call_id / content 原样透传, 不遗漏客户端 post 过来的
+    工具调用字段。
+
+    arguments_as_dict 适配(Llama 3.x 与 GLM-4.5/4.6/4.7): 这些模板按**对象**渲染
+    arguments(GLM-4.7 的 `{% for k, v in tc.arguments.items() %}`、Llama 的
+    `tool_call.arguments | tojson`), 传 JSON 字符串轻则渲染成带引号的字符串, 重则
+    直接抛 UndefinedError(→ 每轮 400); 因此渲染前把字符串解析回 dict。解析失败
+    原样保留(模板渲染成字符串, 不报错)。
+
+    content 为 null 的 assistant 工具调用消息(OpenAI 协议里就是这么写的)归一成
+    空串: 模板对 None 会渲染出字面量 "None"(GLM-4.7 实测), 与模型生成流对不上、
+    还污染下一轮 prompt。只在这一个条件下归一, 不影响其他模型的既有渲染。
+
+    模块级纯函数(不依赖 app 闭包), 便于用真实 tokenizer 做渲染回归测试。
+    """
+    out: list[dict] = []
+    for m in messages:
+        content = getattr(m, "content", None)
+        role = getattr(m, "role", None)
+        tool_calls = getattr(m, "tool_calls", None)
+        # 历史 assistant 消息里的 think 块在渲染前剔除: 返回文本保留 think(见
+        # clean_content), 但思考内容重新进入 prompt 会让模型后续生成退化
+        # (不闭合 think 就调工具/空思考+答非所问), 渲染期剥掉与 vLLM 行为一致
+        if strip_assistant_think and role == "assistant" and isinstance(content, str):
+            content = THINK_BLOCK.sub("", content)
+        if content is None and role == "assistant" and tool_calls is not None:
+            content = ""
+        d = {"role": role, "content": content}
+        if tool_calls is not None:
+            d["tool_calls"] = _adapt_tool_calls(tool_calls, profile)
+        tool_call_id = getattr(m, "tool_call_id", None)
+        if tool_call_id is not None:
+            d["tool_call_id"] = tool_call_id
+            if profile.wrap_tool_output and isinstance(d["content"], str):
+                # Llama 3.x: 工具结果渲染成 {"output": ...} 对象(模板对
+                # 非字符串内容 | tojson 才不加引号)
+                d["content"] = {"output": d["content"]}
+        out.append(d)
+    return out
+
+
+def _adapt_tool_calls(tool_calls: list[dict], profile) -> list[dict]:
+    """按模型适配参数调整 assistant 消息里的 tool_calls, 供模板渲染.
+
+    arguments_as_dict 为假时原样返回; 为真时把 OpenAI 协议里的 arguments
+    (JSON 字符串)解析回对象(见 adapt_openai_messages)。
+    """
+    if not profile.arguments_as_dict:
+        return tool_calls
+    out = []
+    for call in tool_calls:
+        fn = call.get("function") or {}
+        if isinstance(fn.get("arguments"), str):
+            try:
+                fn = {**fn, "arguments": json.loads(fn["arguments"])}
+            except json.JSONDecodeError:
+                pass
+        out.append({**call, "function": fn})
+    return out
+
+
 def create_app(engine: LLMEngine) -> FastAPI:
     """把引擎包装成 FastAPI 应用."""
 
@@ -206,61 +272,17 @@ def create_app(engine: LLMEngine) -> FastAPI:
     def _message_dicts(messages: list[ChatMessage], strip_assistant_think: bool = True) -> list[dict]:
         """pydantic 消息转纯 dict, 交给 chat template 渲染.
 
-        模板里既可能写 message['role'] 也可能写 message.role(jinja 的 `.` 对 dict
-        会回退到下标访问, 对 pydantic 对象则只支持属性访问), 统一转 dict 才能
-        适配任意模板; tool_calls / tool_call_id / content(null) 原样透传,
-        不遗漏客户端 post 过来的工具调用字段.
-
-        Llama 3.x 适配(profile.arguments_as_dict / wrap_tool_output): 官方模板把
-        OpenAI 格式的 tool_calls.arguments(JSON 字符串)直接 | tojson 会渲染成
-        "parameters": "{\"city\": ...}"(字符串被加引号), 工具结果 content 字符串
-        也会被加引号 —— 渲染前把 arguments 还原成 dict、工具结果包成 {"output": ...}
-        对象, 才能得到模型训练时见到的合法 JSON(与 vLLM 的 llama3.1_json 模板一致).
-
-        GLM-4 适配(profile.tool_protocol == "glm4"): 模板只认 assistant.metadata
-        与 observation 角色, 走 adapt_glm4_messages 翻译(见该模块级函数)。
+        渲染协议由模型家族决定, 两种形态各有一个模块级纯函数(便于用真实
+        tokenizer 做回归测试):
+        - GLM-4-0414(profile.tool_protocol == "glm4"): 模板只认 assistant.metadata
+          与 observation 角色, 走 adapt_glm4_messages 翻译;
+        - 其余(模板自己认 OpenAI 的 tool_calls / tool 角色): 走
+          adapt_openai_messages, 按 profile 的 arguments_as_dict / wrap_tool_output
+          调整 arguments 与工具结果的形态。
         """
         if profile.tool_protocol == "glm4":
             return adapt_glm4_messages(messages, strip_assistant_think)
-        out = []
-        for m in messages:
-            content = m.content
-            # 历史 assistant 消息里的 think 块在渲染前剔除: 返回文本保留 think(见
-            # clean_content), 但思考内容重新进入 prompt 会让 Qwen3 后续生成退化
-            # (不闭合 think 就调工具/空思考+答非所问), 渲染期剥掉与 vLLM 行为一致
-            if strip_assistant_think and m.role == "assistant" and isinstance(content, str):
-                content = THINK_BLOCK.sub("", content)
-            d = {"role": m.role, "content": content}
-            if m.tool_calls is not None:
-                d["tool_calls"] = _adapt_tool_calls(m.tool_calls)
-            if m.tool_call_id is not None:
-                d["tool_call_id"] = m.tool_call_id
-                if profile.wrap_tool_output and isinstance(d["content"], str):
-                    # Llama 3.x: 工具结果渲染成 {"output": ...} 对象(模板对
-                    # 非字符串内容 | tojson 才不加引号)
-                    d["content"] = {"output": d["content"]}
-            out.append(d)
-        return out
-
-    def _adapt_tool_calls(tool_calls: list[dict]) -> list[dict]:
-        """按模型适配参数调整 assistant 消息里的 tool_calls, 供模板渲染.
-
-        Llama 3.x: OpenAI 协议里 arguments 是 JSON 字符串, 模板却按对象渲染
-        (tool_call.arguments | tojson), 需要把字符串解析回 dict; 解析失败则
-        原样保留(模板会渲染成带引号的字符串, 与协议一致, 不报错).
-        """
-        if not profile.arguments_as_dict:
-            return tool_calls
-        out = []
-        for call in tool_calls:
-            fn = call.get("function") or {}
-            if isinstance(fn.get("arguments"), str):
-                try:
-                    fn = {**fn, "arguments": json.loads(fn["arguments"])}
-                except json.JSONDecodeError:
-                    pass
-            out.append({**call, "function": fn})
-        return out
+        return adapt_openai_messages(messages, profile, strip_assistant_think)
 
     def _check_model(model_field: str | None) -> None:
         """请求里的 model 若与当前加载模型不一致则报错(与 vLLM 行为一致)."""

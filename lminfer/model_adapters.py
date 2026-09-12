@@ -17,7 +17,15 @@ LMInfer 只依赖 transformers 的高层 API, 但不同模型家族在工具调�
   `<|user|>` 结束), 解析器是 glm4; 消息协议用 assistant 的 `metadata` 字段承载
   函数名、content 承载参数 JSON, 工具结果用 `observation` 角色 —— 该 jinja 模板
   **不认** OpenAI 的 `tool` 角色与 `tool_calls` 字段, 直接透传会把工具调用整段
-  丢掉(见 ModelProfile.tool_protocol)。
+  丢掉(见 ModelProfile.tool_protocol);
+- GLM-4.5/4.6/4.7 系 MoE(glm4_moe / glm4_moe_lite): 工具调用是 **XML 协议**
+  `<tool_call>函数名<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+  (vLLM 的 glm45/glm47 同一个 parser), 与上面 glm4 的 `name\n{json}` 完全不同;
+  模板**原生认 OpenAI 的 `tool_calls` / `tool` 角色**, 只是 arguments 必须是对象
+  (见 ModelProfile.arguments_as_dict)。这一系的 tokenizer 里 `<tool_call>` 是单
+  特殊 token, 按 token 探测会先命中 hermes(块体却是 XML 而非 JSON), 必须按
+  config.model_type 抢先判定。GLM-4.7-Flash(glm4_moe_lite)还是 **MLA** 注意力:
+  缓存里带位置信息的是 k_rot(value 槽), RoPE 布局见 RopeLayout.rotated_slot。
 
 `--tool-call-parser` 的默认值 auto 在这里解析成具体解析器(依据 config 的
 model_type 或 tokenizer 的特殊 token 自动识别), 显式指定
@@ -53,6 +61,17 @@ GLM_ROLE_MARKERS = ("<|system|>", "<|user|>", "<|assistant|>", GLM_OBSERVATION)
 # 文本协议, RoPE 是部分旋转 + 奇偶交错。刻意只列 "glm4": GLM-4.5/MoE(glm4_moe)
 # 用的是 <tool_call><arg_key>... 的 XML 协议, 不能共用这套识别。
 GLM4_MODEL_TYPES = ("glm4",)
+# GLM-4.5/4.6/4.7 系 MoE: 工具调用是 <tool_call>函数名<arg_key>k</arg_key>
+# <arg_value>v</arg_value></tool_call> 的 XML 协议(解析器 glm4_moe)。
+GLM4_MOE_MODEL_TYPES = ("glm4_moe", "glm4_moe_lite")
+# MLA(Multi-head Latent Attention)的家族: 缓存里存的是压缩潜向量(kv_lora_rank)
+# 与共享的旋转键 k_rot(qk_rope_head_dim), 带位置信息的只有后者且落在 value 槽。
+# 只有 glm4_moe_lite(GLM-4.7-Flash)在 transformers 里是 MLA 实现: glm4_moe
+# (GLM-4.5)走的是普通 q/k/v 投影 + 经典 (key, value) 缓存, 不能按 MLA 处理。
+MLA_MODEL_TYPES = ("glm4_moe_lite",)
+# --tool-call-parser 的 vLLM 兼容别名: vLLM 把 glm45/glm47 都注册到同一个
+# glm47_moe parser(即本仓库的 glm4_moe), 从 vLLM 命令直接抄过来要能用。
+TOOL_PARSER_ALIASES = {"glm45": "glm4_moe", "glm47": "glm4_moe"}
 
 
 @dataclass(frozen=True)
@@ -148,18 +167,38 @@ def _is_glm4_family(model_config, tokenizer) -> bool:
     return _has_special_token(tokenizer, GLM_OBSERVATION)
 
 
+def _is_glm4_moe_family(model_config) -> bool:
+    """是否 GLM-4.5/4.6/4.7 系 MoE(工具调用是 `<tool_call>...<arg_key>` XML 协议).
+
+    只看 config.model_type: 这一系的 tokenizer 里 `<tool_call>` 是**单特殊 token**,
+    按 token 探测会先命中 hermes —— 而 hermes 的块体是 JSON, 对 XML 块 `json.loads`
+    必然失败, 结果是工具调用被 cleaner 整段删掉、客户端拿到的 content 里连原文都
+    没有(实测)。所以家族判定必须在 token 探测之前。
+    """
+    model_type = (str(getattr(model_config, "model_type", "") or "")
+                  if model_config is not None else "")
+    return model_type.lower() in GLM4_MOE_MODEL_TYPES
+
+
 def resolve_tool_parser(configured: str, tokenizer, model_config=None) -> str:
     """把配置值解析成具体解析器: auto 依据 config/tokenizer 自动识别.
 
+    - config.model_type 是 glm4_moe/glm4_moe_lite(GLM-4.5/4.6/4.7 系) -> glm4_moe
+      的 XML 解析(必须最先判: 这些 tokenizer 里 `<tool_call>` 也是单 token);
     - 有 `<tool_call>` 特殊 token(Qwen/Hermes 系) -> hermes 风格块解析;
     - 有 `<|python_tag|>` 特殊 token(Llama 3.x 系) -> llama3_json 风格 JSON 解析;
     - 有 `[TOOL_CALLS]` 特殊 token(Mistral v11+ 系) -> mistral 风格解析;
     - config.model_type 是 glm4(GLM-4 系) -> glm4 的 `name\\n{json}` 解析;
     - 都没有 -> none(关闭工具解析, 按普通文本返回).
-    显式指定的 hermes/qwen/llama3_json/mistral/glm4/none 原样使用.
+    显式指定的 hermes/qwen/llama3_json/mistral/glm4/glm4_moe/none 原样使用;
+    vLLM 的 glm45/glm47 当作 glm4_moe 的别名(同一套 XML 协议)。
     """
-    if configured in ("hermes", "qwen", "llama3_json", "mistral", "glm4", "none"):
+    configured = TOOL_PARSER_ALIASES.get(configured, configured)
+    if configured in ("hermes", "qwen", "llama3_json", "mistral", "glm4", "glm4_moe",
+                      "none"):
         return configured
+    if _is_glm4_moe_family(model_config):
+        return "glm4_moe"
     if _has_special_token(tokenizer, TOOL_CALL_START):
         return "hermes"
     if _has_special_token(tokenizer, LLAMA_PYTHON_TAG):
@@ -222,10 +261,14 @@ def resolve_model_profile(configured_parser: str, tokenizer,
             "--tool-call-parser auto 或 %s",
             configured_parser, native, native)
     llama3 = _has_special_token(tokenizer, LLAMA_PYTHON_TAG)
+    # GLM-4.5/4.7 系的模板用 `{% for k, v in tc.arguments.items() %}` 渲染工具调用,
+    # arguments 是 JSON 字符串时直接抛 UndefinedError(→ 400), 与 Llama 3.x 同样
+    # 需要在渲染前把字符串还原成 dict(见 server._adapt_tool_calls)。
+    glm4_moe = native == "glm4_moe"
     return ModelProfile(
         tool_parser=parser,
         native_parser=native,
-        arguments_as_dict=llama3,
+        arguments_as_dict=llama3 or glm4_moe,
         wrap_tool_output=llama3,
         # 工具消息的**渲染**协议由模型家族决定(与配置的解析器无关): GLM-4 的
         # jinja 模板只认 assistant.metadata / observation, 不认 OpenAI 的
@@ -248,11 +291,33 @@ class RopeLayout:
     - interleaved: rotate_half 的配对方式。False = Qwen/Llama/Mistral 的
       "前后对半"(`cat((-x2, x1))`, 配对 (i, i+d/2)); True = GLM/GPT-NeoX 的
       "奇偶交错"(`stack((-x2, x1), -1).flatten()`, 配对 (2i, 2i+1)), 且 cos/sin
-      要用 `repeat_interleave(2)` 展开。
+      要用 `repeat_interleave(2)` 展开;
+    - rotated_slot: **KV cache 里带位置信息的那个槽**。普通 GQA/MHA 是 key 槽
+      (K 旋转、V 不转); MLA(GLM-4.7-Flash)把旋转后的共享键 k_rot 存在 value 槽
+      (实测 `layer.values = [b, 1, s, qk_rope_head_dim]`, `layer.keys` 是位置
+      无关的压缩潜向量 kv_lora_rank), 位置重映射必须按这个槽来选张量。
     """
 
     rotary_dim: int
     interleaved: bool = False
+    rotated_slot: str = "keys"   # "keys" | "values"
+
+
+def _interleaved_rope(config, model_type: str) -> bool:
+    """**KV cache 里的** RoPE 张量是否用奇偶交错配对(GLM/GPT-NeoX 式).
+
+    按模型家族判定: GLM-4-0414 的 attention 用交错式 rotate_half(cos/sin 也要
+    `repeat_interleave(2)` 展开); Qwen/Llama/Mistral 与 GLM-4.5 的普通 q/k/v 实现
+    都是前后对半。
+
+    注意**不能**拿 GLM-4.7 的 `config.rope_interleave=True` 判定这里: 那个标志
+    描述的是"模型读入的原始 k_rot 里复数是 (2i, 2i+1) 排列", 而它的
+    `apply_rotary_pos_emb_interleave` 在写缓存**之前**把结果重排成了前后对半配对
+    (实测: 用模型自己的 apply 在目标位置旋转, 与"对缓存张量做前后对半 delta 旋转"
+    相差 3.6e-07, 用交错式则偏差 4.9 —— 而 k_rot 自身的量级是 3.0)。拼接模式
+    旋转的是缓存里的张量, 必须按缓存的布局来。
+    """
+    return model_type.lower() in GLM4_MODEL_TYPES
 
 
 def resolve_rope_layout(config, head_dim: int | None = None) -> RopeLayout:
@@ -261,11 +326,11 @@ def resolve_rope_layout(config, head_dim: int | None = None) -> RopeLayout:
     `partial_rotary_factor` 出现在 config.rope_parameters(GLM-4-0414 实测)或
     顶层字段(旧版 Llama 实现), 两处都探测。交错式 rotate_half 由模型家族决定,
     无法从 rope 模块的返回值区分(它们都返回 `cat((freqs, freqs))`, 差别只在
-    attention 里的 apply), 因此按 model_type 判定。
+    attention 里的 apply), 因此按 model_type 判定(见 _interleaved_rope)。
+    MLA(glm4_moe_lite)另走一支: 参与旋转的只有 k_rot, 宽度是 `qk_rope_head_dim`
+    而不是传进来的 head_dim(key 槽宽度 kv_lora_rank, 对 MLA 没有意义)。
     """
-    if head_dim is None:
-        head_dim = (getattr(config, "head_dim", None)
-                    or config.hidden_size // config.num_attention_heads)
+    model_type = (str(getattr(config, "model_type", "") or "") if config is not None else "")
     params = getattr(config, "rope_parameters", None) or {}
     factor = params.get("partial_rotary_factor")
     if factor is None:
@@ -274,10 +339,37 @@ def resolve_rope_layout(config, head_dim: int | None = None) -> RopeLayout:
         factor = float(factor)
     except (TypeError, ValueError):
         factor = 1.0
-    rotary_dim = max(1, min(int(head_dim * factor), head_dim))
+    if model_type.lower() in MLA_MODEL_TYPES:
+        rope_dim = int(getattr(config, "qk_rope_head_dim", 0) or 0) or (head_dim or 0)
+        rotary_dim = max(1, min(int(rope_dim * factor), rope_dim)) if rope_dim else 1
+        # 配对是前后对半(缓存的 k_rot 经过 apply_rotary_pos_emb_interleave 的重排),
+        # 只是张量落在 value 槽 —— 见 _interleaved_rope 的说明
+        return RopeLayout(rotary_dim=rotary_dim, interleaved=False,
+                          rotated_slot="values")
+    if head_dim is None:
+        head_dim = (getattr(config, "head_dim", None)
+                    or config.hidden_size // config.num_attention_heads)
+    return RopeLayout(rotary_dim=max(1, min(int(head_dim * factor), head_dim)),
+                      interleaved=_interleaved_rope(config, model_type))
+
+
+def kv_bytes_per_token(config, dtype_size: int) -> int:
+    """每生成 1 个 token、全部层新增的 KV 显存字节数(引擎日志与 /v1/stats 用).
+
+    普通 GQA/MHA: `2(K+V) × 层数 × KV头数 × head_dim × 每元素字节数`;
+    MLA(glm4_moe_lite): 缓存的是压缩潜向量 —— 每层每 token 只有
+    `kv_lora_rank + qk_rope_head_dim` 个数(实测 `layer.keys` 512 + `layer.values`
+    64), 与注意力头数无关。按通用公式算会高估 4 倍以上。
+    """
+    num_layers = config.num_hidden_layers
     model_type = (str(getattr(config, "model_type", "") or "") if config is not None else "")
-    return RopeLayout(rotary_dim=rotary_dim,
-                      interleaved=model_type.lower() in GLM4_MODEL_TYPES)
+    if model_type.lower() in MLA_MODEL_TYPES:
+        per_token = (int(getattr(config, "kv_lora_rank", 0) or 0)
+                     + int(getattr(config, "qk_rope_head_dim", 0) or 0))
+        return num_layers * per_token * dtype_size
+    num_kv_heads = getattr(config, "num_key_value_heads", None) or config.num_attention_heads
+    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+    return 2 * num_layers * num_kv_heads * head_dim * dtype_size
 
 
 # ---------------------------------------------------------------------------

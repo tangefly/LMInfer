@@ -13,6 +13,7 @@ from lminfer.toolcalls import (
     MistralStreamSplitter,
     clean_output_content,
     make_stream_splitter,
+    parse_glm4_moe_tool_calls,
     parse_glm4_tool_calls,
     parse_mistral_tool_calls,
     parse_model_output,
@@ -45,6 +46,14 @@ MISTRAL_TOK = _Tokenizer(["[TOOL_CALLS]", "[ARGS]",
 GLM4_ROLE_TOKENS = ["[gMASK]", "<sop>", "<|system|>", "<|user|>",
                     "<|assistant|>", "<|observation|>"]
 GLM4_TOK = _Tokenizer(GLM4_ROLE_TOKENS)
+# GLM-4.7-Flash tokenizer: <tool_call>/<arg_key>/<arg_value> 都是**单特殊 token**
+# (按 token 探测会先命中 hermes, 必须靠 config.model_type 抢在它前面判定)
+GLM4_MOE_TOKENS = GLM4_ROLE_TOKENS + ["<tool_call>", "</tool_call>",
+                                      "<arg_key>", "</arg_key>",
+                                      "<arg_value>", "</arg_value>",
+                                      "<tool_response>", "</tool_response>",
+                                      "<think>", "</think>"]
+GLM4_MOE_TOK = _Tokenizer(GLM4_MOE_TOKENS)
 PLAIN_TOK = _Tokenizer([])
 
 
@@ -90,6 +99,37 @@ class ToolParserResolutionTest(unittest.TestCase):
 
     def test_explicit_glm4_parser_kept(self):
         self.assertEqual(resolve_tool_parser("glm4", PLAIN_TOK), "glm4")
+
+    def test_auto_detection_glm4_moe_beats_tool_call_token(self):
+        # GLM-4.7-Flash: <tool_call> 是单特殊 token, 但块体是 XML 而不是 JSON ——
+        # 若被 hermes 抢先识别, 解析必然失败且工具调用会被 cleaner 整段删掉。
+        for model_type in ("glm4_moe_lite", "glm4_moe"):
+            self.assertEqual(
+                resolve_tool_parser("auto", GLM4_MOE_TOK, _Config(model_type)),
+                "glm4_moe")
+        # 同样的 tokenizer 上没有 config 时仍退回 hermes(其他家族的既有行为不变)
+        self.assertEqual(resolve_tool_parser("auto", GLM4_MOE_TOK), "hermes")
+
+    def test_vllm_parser_name_aliases(self):
+        # vLLM 把 glm45/glm47 注册到同一个 parser, 从 vLLM 命令抄过来要能用
+        self.assertEqual(resolve_tool_parser("glm47", PLAIN_TOK), "glm4_moe")
+        self.assertEqual(resolve_tool_parser("glm45", PLAIN_TOK), "glm4_moe")
+        profile = resolve_model_profile("glm47", GLM4_MOE_TOK,
+                                        _Config("glm4_moe_lite"))
+        self.assertEqual(profile.tool_parser, "glm4_moe")
+        # 别名归一化后与原生协议一致: 不该报"配置与模型家族冲突"
+        self.assertIsNone(profile.fallback_parser)
+
+    def test_profile_for_glm4_moe(self):
+        profile = resolve_model_profile("auto", GLM4_MOE_TOK,
+                                        _Config("glm4_moe_lite"))
+        self.assertEqual(profile.native_parser, "glm4_moe")
+        # 模板用 `tc.arguments.items()` 渲染: arguments 必须是对象
+        self.assertTrue(profile.arguments_as_dict)
+        # 工具结果窗口与 Qwen 系是同一对 <tool_response>, 且走通用渲染分支
+        self.assertEqual(resolve_tool_result_wrapper(GLM4_MOE_TOK),
+                         ToolResultWrapper("<tool_response>", "</tool_response>"))
+        self.assertEqual(profile.tool_protocol, "openai")
 
     def test_tool_result_wrapper_detection(self):
         self.assertEqual(resolve_tool_result_wrapper(HERMES_TOK),
@@ -537,6 +577,205 @@ class Glm4StreamSplitterTest(unittest.TestCase):
             list(splitter.flush())
         self.assertEqual([k for k, _ in events], ["tool_call"])
         self.assertEqual(events[0][1]["function"]["name"], "call_subagent")
+
+
+class Glm4MoeToolCallTest(unittest.TestCase):
+    """GLM-4.7-Flash 的 XML 工具调用协议(实测输出形态, vLLM 的 glm45/glm47)."""
+
+    # 本机模型真实输出(enable_thinking=False; 结尾 <|observation|> 是 eos)
+    GLM4_MOE_CALL = ("<tool_call>call_subagent<arg_key>task</arg_key>"
+                     "<arg_value>Find the current population of Reykjavik."
+                     "</arg_value></tool_call>")
+    SCHEMAS_GLM4_MOE = {"call_subagent": {"type": "object", "properties": {
+        "task": {"type": "string"}}}}
+
+    def test_real_output_parses_with_verbatim_argument_values(self):
+        text = ("I'll delegate a research task.<tool_call>call_subagent"
+                "<arg_key>task</arg_key><arg_value>Find the current population "
+                "of Reykjavik, Iceland.</arg_value></tool_call><|observation|>")
+        calls, content = parse_model_output(text, "glm4_moe", None,
+                                            schemas=self.SCHEMAS_GLM4_MOE)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "call_subagent")
+        self.assertEqual(calls[0]["type"], "function")
+        # 值按原始文本保留字符串: 模板对字符串参数原样渲染, 回填后的 prompt 才能
+        # 与生成流逐位一致(实测 round-trip LCP 整段命中)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"task": "Find the current population of Reykjavik, Iceland."})
+        # 调用前的正文原样返回(不 strip), 供客户端回填、KV 前缀覆盖整段输出
+        self.assertEqual(content, "I'll delegate a research task.")
+
+    def test_call_without_arguments(self):
+        calls = parse_glm4_moe_tool_calls("<tool_call>get_time</tool_call>")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_time")
+        self.assertEqual(calls[0]["function"]["arguments"], "{}")
+
+    def test_multiple_calls_and_surrounding_prose(self):
+        text = (self.GLM4_MOE_CALL
+                + "\nmore prose\n"
+                + '<tool_call>search<arg_key>q</arg_key><arg_value>r</arg_value>'
+                  '</arg_key></tool_call>')
+        calls = parse_glm4_moe_tool_calls(text, {"call_subagent": {}, "search": {}})
+        self.assertEqual([c["function"]["name"] for c in calls],
+                         ["call_subagent", "search"])
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"]), {"q": "r"})
+
+    def test_think_block_is_not_part_of_arguments(self):
+        # thinking 开启时输出以推理正文开头(模板已预开 <think>), 解析器只看工具块
+        text = "<think>the user wants ...</think>Let me delegate." + self.GLM4_MOE_CALL
+        calls, content = parse_model_output(text, "glm4_moe", None,
+                                            schemas=self.SCHEMAS_GLM4_MOE)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(content, "Let me delegate.")
+
+    def test_content_cleaner_drops_call_blocks(self):
+        # 输入是引擎给解析器的可见输出: 结尾的 <|observation|> 是 eos, 不入 output_text
+        text = "答案在下面\n" + self.GLM4_MOE_CALL
+        self.assertEqual(clean_output_content(text, "glm4_moe"), "答案在下面")
+        # 普通回答不受影响(没有 <tool_call> 标记)
+        answer = "雷克雅未克人口约 14 万。"
+        self.assertEqual(clean_output_content(answer, "glm4_moe"), answer)
+
+    def test_schema_repairs_stringified_array(self):
+        calls = parse_glm4_moe_tool_calls(
+            '<tool_call>research<arg_key>query</arg_key><arg_value>q</arg_value>'
+            '<arg_key>source_ids</arg_key>'
+            "<arg_value>['S1']</arg_value></tool_call>", SCHEMAS)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["source_ids"],
+                         ["S1"])
+
+    def test_conflicting_parser_falls_back_to_glm4_moe(self):
+        # 照抄别的模型的启动参数(hermes)时不能静默丢调用: hermes 会把 XML 块
+        # 整段删掉, 必须靠原生协议兜底解析出来
+        self.assertEqual(parse_output_tool_calls(self.GLM4_MOE_CALL, "hermes"), [])
+        self.assertEqual(clean_output_content(self.GLM4_MOE_CALL, "hermes"), "")
+        calls, content = parse_model_output(self.GLM4_MOE_CALL, "hermes", "glm4_moe",
+                                            schemas=self.SCHEMAS_GLM4_MOE)
+        self.assertEqual(calls[0]["function"]["name"], "call_subagent")
+        self.assertIsNone(content)
+
+
+class Glm4MoeStreamSplitterTest(unittest.TestCase):
+    def split(self, chunks):
+        splitter = make_stream_splitter("glm4_moe")
+        events = []
+        for chunk in chunks:
+            events.extend(splitter.push(chunk))
+        events.extend(splitter.flush())
+        return events
+
+    def test_stream_splits_call(self):
+        events = self.split(["I'll delegate.", "<tool_call>call_subagent<arg_key>",
+                             "task</arg_key><arg_value>Find it",
+                             "</arg_value></tool_call>"])
+        self.assertEqual([k for k, _ in events], ["content", "content", "tool_call"])
+        # 正文可能被"半截标记"扣留逻辑切成多个 content 事件, 拼起来必须原样
+        self.assertEqual("".join(p for k, p in events if k == "content"),
+                         "I'll delegate.")
+        call = events[-1][1]
+        self.assertEqual(call["function"]["name"], "call_subagent")
+        self.assertEqual(json.loads(call["function"]["arguments"]),
+                         {"task": "Find it"})
+
+    def test_marker_never_leaks_into_content(self):
+        # 标记被拆成多 chunk 到达时不能提前当普通文本输出
+        events = self.split(["<tool", "_call>get_time</tool", "_call>"])
+        self.assertEqual([k for k, _ in events], ["tool_call"])
+
+    def test_normal_answer_passes_through(self):
+        events = self.split(["雷克雅未克人口", "约 14 万。"])
+        self.assertEqual([k for k, _ in events], ["content", "content"])
+        self.assertEqual("".join(p for _, p in events), "雷克雅未克人口约 14 万。")
+
+    def test_incomplete_call_flushed_as_text(self):
+        events = self.split(["<tool_call>call_subagent<arg_key>task</arg_key>"])
+        self.assertEqual([k for k, _ in events], ["content"])
+        self.assertIn("call_subagent", events[0][1])
+
+    def test_stream_multiple_calls(self):
+        events = self.split([Glm4MoeToolCallTest.GLM4_MOE_CALL,
+                             "<tool_call>search<arg_key>q</arg_key>"
+                             "<arg_value>r</arg_value></tool_call>"])
+        calls = [p for k, p in events if k == "tool_call"]
+        self.assertEqual([c["function"]["name"] for c in calls],
+                         ["call_subagent", "search"])
+
+
+class Glm4MoeMessageRenderingTest(unittest.TestCase):
+    """GLM-4.7-Flash 的 OpenAI 消息渲染: 模板原生认 tool_calls/tool, 但 arguments
+    必须是对象、content=null 必须归一(否则渲染出字面量 None)。"""
+
+    SYSTEM = "You are a research agent. Delegate work with the tool."
+    USER = "Delegate a sub agent to find the population of Reykjavik."
+    # 本机模型实测原始输出(enable_thinking=False) = 调用前正文 + 工具调用 + eos
+    PROSE = "I'll delegate a research task to find the population of Reykjavik."
+    GEN = (PROSE + "<tool_call>call_subagent<arg_key>task</arg_key>"
+           "<arg_value>Find the current population of Reykjavik, Iceland."
+           "</arg_value></tool_call><|observation|>")
+    SUB_ANSWER = "Reykjavik has about 140000 residents."
+
+    def _profile(self):
+        from lminfer.model_adapters import resolve_model_profile
+        return resolve_model_profile("auto", GLM4_MOE_TOK, _Config("glm4_moe_lite"))
+
+    def _messages(self, content=None):
+        from lminfer.schemas import ChatMessage
+        return [
+            ChatMessage(role="system", content=self.SYSTEM),
+            ChatMessage(role="user", content=self.USER),
+            ChatMessage(role="assistant", content=content, tool_calls=[{
+                "id": "call_1", "type": "function",
+                "function": {"name": "call_subagent",
+                             "arguments": json.dumps(
+                                 {"task": "Find the current population of "
+                                          "Reykjavik, Iceland."})}}]),
+            ChatMessage(role="tool", tool_call_id="call_1", content=self.SUB_ANSWER),
+        ]
+
+    def test_arguments_string_becomes_object_and_null_content_is_empty(self):
+        from lminfer.server import adapt_openai_messages
+        out = adapt_openai_messages(self._messages(), self._profile())
+        # arguments(JSON 字符串)还原成对象: 模板用 `tc.arguments.items()` 渲染,
+        # 字符串会直接抛 UndefinedError(→ 400)
+        self.assertEqual(out[2]["tool_calls"][0]["function"]["arguments"],
+                         {"task": "Find the current population of Reykjavik, Iceland."})
+        # OpenAI 协议里工具调用消息的 content 是 null: 归一成空串, 否则模板渲染出
+        # 字面量 "None"
+        self.assertEqual(out[2]["content"], "")
+        self.assertEqual(out[3]["role"], "tool")
+        self.assertEqual(out[3]["content"], self.SUB_ANSWER)
+
+    def test_renders_with_real_tokenizer_and_round_trips_token_exact(self):
+        import os
+        from lminfer.server import adapt_openai_messages
+        model = "/public/home/xiaoxunpeng/Models/GLM-4.7-Flash"
+        if not os.path.isdir(model):
+            self.skipTest("GLM-4.7-Flash not present locally")
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(model)
+
+        def ids(messages):
+            text = tok.apply_chat_template(adapt_openai_messages(messages, profile),
+                                           add_generation_prompt=True,
+                                           enable_thinking=False, tokenize=False)
+            return text, tok(text)["input_ids"]
+
+        profile = self._profile()
+        _, turn1 = ids(self._messages()[:2])
+        # 客户端把模型的回复(含正文与 tool_calls)回填, 服务器渲染出的第二轮 prompt
+        text2, turn2 = ids(self._messages(content=self.PROSE))
+        # 工具调用渲染成 XML 块, 工具结果是 <|observation|><tool_response>...</...>
+        self.assertIn("<tool_call>call_subagent<arg_key>task</arg_key>", text2)
+        self.assertIn(f"<|observation|><tool_response>{self.SUB_ANSWER}"
+                      "</tool_response>", text2)
+        self.assertNotIn("None", text2)
+        # 第一轮 prompt 是第二轮 prompt 的前缀(带 tool_calls 的回合能整段复用 KV)
+        self.assertEqual(turn2[:len(turn1)], turn1)
+        # 回填出的"正文 + 工具调用 + <|observation|>"与模型自己生成的 token 逐位
+        # 一致 —— 跨请求 KV 前缀复用(LCP)能覆盖整个工具调用回合
+        gen_ids = tok(self.GEN)["input_ids"]
+        self.assertEqual(turn2[len(turn1):len(turn1) + len(gen_ids)], gen_ids)
 
 
 class Glm4MessageRenderingTest(unittest.TestCase):

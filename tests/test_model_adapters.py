@@ -9,13 +9,15 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from transformers import Glm4Config, Mistral3Config, Qwen3Config, Qwen3MoeConfig
+from transformers import (Glm4Config, Glm4MoeConfig, Glm4MoeLiteConfig,
+                          Mistral3Config, Qwen3Config, Qwen3MoeConfig)
 
 from lminfer import model_adapters
 from lminfer.model_adapters import (
     RopeLayout,
     _is_finegrained_fp8,
     _supports_causal_lm,
+    kv_bytes_per_token,
     load_text_model,
     resolve_model_profile,
     resolve_rope_layout,
@@ -156,6 +158,28 @@ class ResolveRopeLayoutTest(unittest.TestCase):
         layout = resolve_rope_layout(config)
         self.assertEqual(layout.rotary_dim, config.head_dim // 2)
 
+    def test_glm4_moe_lite_is_mla_with_value_slot_rope(self):
+        # GLM-4.7-Flash: 参与旋转的只有 k_rot(qk_rope_head_dim=64, 全部维度),
+        # 在 KV cache 里落在 value 槽; 传进来的 head_dim 是 key 槽宽度(潜向量
+        # kv_lora_rank=512), 对 RoPE 没有意义, 不能被它带偏。
+        # 配对是**前后对半**而不是 config.rope_interleave 暗示的交错式: 模型的
+        # apply_rotary_pos_emb_interleave 在写缓存前把结果重排成了前后对半配对
+        # (数值验证见 tests/test_kvcache.py::Glm4MoeLiteRopeRebaseTest)。
+        config = Glm4MoeLiteConfig()
+        layout = resolve_rope_layout(config, config.kv_lora_rank)
+        self.assertEqual(layout.rotary_dim, config.qk_rope_head_dim)
+        self.assertFalse(layout.interleaved)
+        self.assertEqual(layout.rotated_slot, "values")
+        self.assertEqual(layout, RopeLayout(rotary_dim=64, interleaved=False,
+                                            rotated_slot="values"))
+
+    def test_glm4_moe_keeps_classic_key_slot_layout(self):
+        # GLM-4.5(glm4_moe)在 transformers 里是普通 q/k/v + 经典 (key, value) 缓存,
+        # 不是 MLA: 不能把 value 槽当成旋转键
+        layout = resolve_rope_layout(Glm4MoeConfig(), 128)
+        self.assertEqual(layout, RopeLayout(rotary_dim=64, interleaved=False,
+                                            rotated_slot="keys"))
+
 
 class _QwenStubTokenizer:
     """Qwen 系 tokenizer 桩: 只需自动识别与窗口探测用到的两个方法."""
@@ -195,6 +219,65 @@ class Qwen3MoeFamilyTest(unittest.TestCase):
         wrapper = resolve_tool_result_wrapper(tokenizer)
         self.assertEqual((wrapper.open_marker, wrapper.close_marker),
                          ("<tool_response>", "</tool_response>"))
+
+
+class Glm4MoeLiteFamilyTest(unittest.TestCase):
+    """GLM-4.7-Flash(glm4_moe_lite)的家族判定: XML 工具调用 + MLA 的缓存布局.
+
+    与 GLM-4-0414 只共享"是 GLM"这一点: 工具调用是
+    `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+    (vLLM 的 glm45/glm47), 注意力是 MLA。两者都必须显式适配 —— 否则工具调用会被
+    hermes 静默删掉(块体是 XML, json 解析失败), `--graft-rope-rebase` 会旋转
+    位置无关的潜向量、把真正带位置的 k_rot 留在原地。
+    """
+
+    class _Tokenizer:
+        """GLM-4.7-Flash tokenizer 桩(只保留自动识别/窗口探测用到的两个方法)."""
+
+        _TOKENS = {token: i for i, token in enumerate(
+            ["<tool_call>", "</tool_call>", "<|observation|>", "<|system|>",
+             "<|user|>", "<|assistant|>", "<arg_key>", "</arg_key>",
+             "<arg_value>", "</arg_value>", "<tool_response>",
+             "</tool_response>", "<think>", "</think>"])}
+
+        def convert_tokens_to_ids(self, token):
+            return self._TOKENS.get(token, -1)
+
+        def convert_ids_to_tokens(self, tid):
+            return next((t for t, i in self._TOKENS.items() if i == tid), None)
+
+    def test_causal_lm_loads_on_the_plain_text_branch(self):
+        self.assertTrue(_supports_causal_lm(Glm4MoeLiteConfig()))
+
+    def test_tool_protocol_and_window(self):
+        tokenizer = self._Tokenizer()
+        profile = resolve_model_profile("auto", tokenizer,
+                                        Glm4MoeLiteConfig())
+        # <tool_call> 虽然是单特殊 token, 但块体是 XML: 必须判成 glm4_moe 而不是 hermes
+        self.assertEqual(profile.native_parser, "glm4_moe")
+        self.assertEqual(profile.tool_parser, "glm4_moe")
+        self.assertIsNone(profile.fallback_parser)
+        # 模板用 `{% for k, v in tc.arguments.items() %}` 渲染: arguments 必须是对象
+        self.assertTrue(profile.arguments_as_dict)
+        self.assertFalse(profile.wrap_tool_output)
+        # 模板原生认 OpenAI 的 tool_calls / tool 角色, 不走 metadata/observation 翻译
+        self.assertEqual(profile.tool_protocol, "openai")
+        # 工具结果窗口与 Qwen 系同一对标记(两者都是单特殊 token)
+        wrapper = resolve_tool_result_wrapper(tokenizer)
+        self.assertEqual((wrapper.open_marker, wrapper.close_marker),
+                         ("<tool_response>", "</tool_response>"))
+
+    def test_kv_bytes_per_token_counts_compressed_latents(self):
+        # MLA 每层每 token 只存 kv_lora_rank + qk_rope_head_dim 个数, 与 KV 头数无关;
+        # 按通用公式(2 x 头数 x head_dim)会高估 4 倍以上
+        config = Glm4MoeLiteConfig(num_hidden_layers=47)
+        expected = 47 * (config.kv_lora_rank + config.qk_rope_head_dim) * 2
+        self.assertEqual(kv_bytes_per_token(config, 2), expected)
+        # 普通 GQA 仍按 2(K+V) x 层数 x KV头数 x head_dim 计
+        qwen = Qwen3Config()
+        self.assertEqual(kv_bytes_per_token(qwen, 2),
+                         2 * qwen.num_hidden_layers * qwen.num_key_value_heads
+                         * qwen.head_dim * 2)
 
 
 class ResolveLogitsKwargsTest(unittest.TestCase):
