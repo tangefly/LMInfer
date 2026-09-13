@@ -256,7 +256,11 @@ def _rope_delta_cos_sin(length: int, delta: int, head_dim: int, config,
                 cos = cos[..., :half].repeat_interleave(2, dim=-1)
                 sin = sin[..., :half].repeat_interleave(2, dim=-1)
             if cos.shape[-1] == layout.rotary_dim and sin.shape[-1] == layout.rotary_dim:
-                return cos.to(dtype=dtype), sin.to(dtype=dtype)
+                # device_map 多卡下 RoPE 模块自身只驻留一张卡(buffer inv_freq 跟随
+                # 模块), 输出会落在模块所在卡而不是调用方传入的 device —— 显式搬回,
+                # 否则另一张卡上的层做 rebase 时 target * cos 直接报设备不匹配。
+                return (cos.to(device=device, dtype=dtype),
+                        sin.to(device=device, dtype=dtype))
             logger.warning("RoPE 模块输出形状 %s 与 rotary_dim %d 不符, "
                            "回退默认 RoPE 公式", tuple(cos.shape), layout.rotary_dim)
         except Exception as exc:  # noqa: BLE001 - 兜底回退, 不让实验路径直接崩
