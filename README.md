@@ -400,6 +400,24 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
   arguments 合法，朴素实现只解析不约束，JSON 的合法性依赖模型自身（对
   Qwen3 系模型通常没问题）。
 
+**多卡（`device_map="auto"`）**
+
+设 `CUDA_VISIBLE_DEVICES=0,1` 即可把模型按层切到两张卡，**不需要改代码**
+（`EngineConfig.device_map` 缺省就是 `"auto"`，CLI 未暴露该参数）。注意 `auto` 是
+**按可用显存平摊到所有可见 GPU**，不是顺序填满：8 卡节点上不加该环境变量会被切成 8 份
+（实测 4 卡可见时是 12/13/13/10 层）。
+
+KV 复用/拼接链路（`slice_cache` / `tail_cache` / `concat_cache` / `rebase_rope_cache`）
+全是 **per-layer** 操作，第 i 层永远配第 i 层，天然同卡，因此双卡下语义不变，也不引入
+额外数值误差（Qwen3-30B-A3B 实测：LCP 复用等价性与单卡**逐位相同**）。
+
+但层切分是 pipeline 并行 —— batch=1 自回归解码时同一时刻只有一张卡在算、另一张空转，
+层边界还要跨卡搬 hidden states，因此是**负优化**（Qwen3-30B-A3B 实测 9.5 → 6.5 tok/s）。
+上双卡的理由只有显存（权重压在单张 80GB 卡上只剩约 20 GiB 给 KV）；要吞吐应改用
+两进程各占一卡 + 轮询路由，KV 复用功能原样保留。完整实测、以及一个**双卡才暴露的
+RoPE 设备缺陷**（`_rope_delta_cos_sin` 的输出必须搬回调用方请求的 device）见
+[docs/glm47.md](docs/glm47.md) 与 [docs/qwen3moe.md](docs/qwen3moe.md) 的多卡一节。
+
 ## Agent 模式（会话追踪）
 
 模型调用程序可以按两种模式调用 `/v1/chat/completions`：

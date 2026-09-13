@@ -747,5 +747,44 @@ class Qwen3MoeRopeRebaseTest(unittest.TestCase):
                                    atol=1e-5, rtol=1e-5)
 
 
+class RopeModuleDeviceTest(unittest.TestCase):
+    """多卡(device_map) 下 RoPE 相位张量必须落在调用方请求的 device 上.
+
+    实测(Qwen3-30B-A3B / GLM-4.7-Flash, 2×H100): accelerate 把
+    `model.model.rotary_emb` 整个模块放在**其中一张卡**上(inv_freq buffer 跟着模块
+    走), 于是 `rope(probe, positions)` 的返回值落在模块所在卡, 而不跟随调用方传入的
+    device。rebase 是**逐层**做的(见 rebase_rope_cache), 另一张卡上的层拿到异构的
+    cos/sin 后 `target * cos` 直接 RuntimeError —— 单卡所有张量同设备, 永远不暴露。
+
+    用 meta 设备当"另一张卡"的替身, 不要求跑测试的机器真有 2 张 GPU。
+    """
+
+    LENGTH, DELTA, ROTARY_DIM = 4, 5, 8
+
+    class _PlainConfig:
+        """最小 config: 非 MLA、非 GLM(前后对半配对)、full-dim 旋转."""
+        model_type = "qwen3"
+        rope_parameters = {"rope_theta": 10000.0}
+
+    class _ModuleOnAnotherDevice:
+        """最小 RoPE 替身: 输出固定落在自己那张设备上, 忽略入参的 device."""
+
+        def __call__(self, x, position_ids):
+            n = position_ids.shape[-1]
+            return (torch.ones(1, n, RopeModuleDeviceTest.ROTARY_DIM),
+                    torch.zeros(1, n, RopeModuleDeviceTest.ROTARY_DIM))
+
+    def test_phase_tensors_follow_the_requested_device(self):
+        # 请求 meta(= 另一张卡), 模块却返回 CPU 张量: 必须搬回请求的 device,
+        # 否则 rebase 里 `target * cos` 会在多卡下报设备不匹配
+        requested = torch.device("meta")
+        cos, sin = _rope_delta_cos_sin(
+            self.LENGTH, self.DELTA, self.ROTARY_DIM, self._PlainConfig(),
+            requested, torch.float32, self._ModuleOnAnotherDevice())
+
+        self.assertEqual(cos.device.type, requested.type)
+        self.assertEqual(sin.device.type, requested.type)
+
+
 if __name__ == "__main__":
     unittest.main()

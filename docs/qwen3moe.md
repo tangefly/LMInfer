@@ -160,6 +160,34 @@ OK: Qwen3-30B-A3B-Instruct-2507 子 agent 输出 KV 复用链路跑通
 batch=1、`sdpa`、无连续批处理、无 CUDA Graph —— 这是朴素实现的预期量级；
 MoE 的收益在**权重显存**（30B 参数只激活 3B，但朴素实现仍是全权重常驻）。
 
+## 多卡（`device_map="auto"`）
+
+设 `CUDA_VISIBLE_DEVICES=0,1` 即可切成两张卡，不需要改代码（`EngineConfig.device_map`
+缺省就是 `"auto"`，CLI 未暴露该参数）。权重 57.7 GiB 按层对半：layers 0..23 在 cuda:0、
+24..47 在 cuda:1。
+
+注意 `device_map="auto"` 是**按可用显存平摊到所有可见 GPU**，不是顺序填满：8 卡节点上
+不加 `CUDA_VISIBLE_DEVICES` 会被切成 8 份（实测 4 卡可见时是 12/13/13/10 层）。
+
+**一个双卡才暴露的缺陷（已修）**：`Qwen3MoeRotaryEmbedding` 作为单个模块被 accelerate
+整个放在 cuda:1（`inv_freq` buffer 跟着模块走），`rope(probe, positions)` 的输出因此落在
+模块所在卡，而不跟随 `rebase_rope_cache` 传入的 `target.device` —— cuda:0 上的层做
+`--graft-rope-rebase` 时 `target * cos` 直接报设备不匹配。修法（`_rope_delta_cos_sin` 显式
+搬回请求的 device）与完整分析见 `docs/glm47.md` 的多卡一节，GLM-4.7-Flash 是同一个成因。
+
+实测（2×H100）：
+
+| | 单卡 | 双卡（层切分） |
+|---|---|---|
+| 权重 | 57.0 GiB / 1 卡 | 28.5 + 28.5 GiB |
+| LCP 复用等价性（末位 logits 相对误差） | 3.33e-02 | **3.33e-02（逐位相同）** |
+| decode（batch=1，64 tok） | **9.5 tok/s** | 6.5 tok/s |
+
+双卡**不引入额外数值误差**（复用等价性与单卡逐位相同，KV 操作全是 per-layer、天然同卡），
+但层切分是 pipeline 并行：batch=1 自回归解码时同一时刻只有一张卡在算，拿不到并行收益，
+反而慢约 46%。上双卡的理由只有显存（权重 57.7 GiB 压一张 80GB 卡只剩约 20 GiB 给 KV）；
+要吞吐应改用两进程各占一卡 + 轮询路由，KV 复用功能原样保留且吞吐翻倍。
+
 ## 已知边界
 
 - **`--repair-mode context` 不适用于本模型**：分层修复是 dense Qwen3 专用的

@@ -179,6 +179,66 @@ WARNING tool-call-parser=hermes 未识别到工具调用(请求 4da04974b378), �
 对应单元测试：`tests/test_kvcache.py::Glm4MoeLiteRopeRebaseTest`；布局判定见
 `tests/test_model_adapters.py::ResolveRopeLayoutTest::test_glm4_moe_lite_is_mla_with_value_slot_rope`。
 
+## 多卡（`device_map="auto"`）
+
+实测 2×H100 80GB：设 `CUDA_VISIBLE_DEVICES=0,1` 即可，**不需要改任何代码**
+（`EngineConfig.device_map` 缺省就是 `"auto"`，CLI 未暴露该参数）。权重按层切开：
+layers 0..23 在 cuda:0、24..46 在 cuda:1。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 -m lminfer serve \
+  /public/home/xiaoxunpeng/Models/GLM-4.7-Flash \
+  --served-model-name GLM-4.7-Flash --max-model-len 40960 \
+  --reuse-agent-kv-append --graft-rope-rebase \
+  --repair-window-begin 0.1 --repair-window-end 0.1 \
+  --no-enable-thinking --enable-auto-tool-choice --port 8012
+```
+
+注意 `device_map="auto"` 是**按可用显存平摊到所有可见 GPU**，不是顺序填满：8 卡节点上
+不加 `CUDA_VISIBLE_DEVICES` 会被切成 8 份（实测 4 卡可见时是 12/13/13/10 层）。
+
+### 双卡踩到的坑：RoPE 模块只驻留一张卡
+
+`model.model.rotary_emb` 作为**单个模块**被 accelerate 放在其中一张卡上（实测
+`inv_freq` buffer 在 cuda:1），`rope(probe, positions)` 的返回值因此落在**模块所在卡**，
+而不跟随 `rebase_rope_cache` 传入的 `target.device`。rebase 是逐层做的，于是 cuda:0 上的
+层拿到 cuda:1 的 cos/sin，`target * cos` 直接报：
+
+```text
+RuntimeError: Expected all tensors to be on the same device,
+              but found at least two devices, cuda:0 and cuda:1!
+```
+
+单卡所有张量同设备，永远不暴露；此前的单元测试也没覆盖这条契约。
+
+修法：`kvcache._rope_delta_cos_sin` 把模型 RoPE 的输出显式搬回调用方请求的 device
+（单卡下是 no-op）。回归测试 `tests/test_kvcache.py::RopeModuleDeviceTest` 用 meta 设备
+当“另一张卡”的替身，不要求跑测试的机器真有 2 张 GPU。
+Qwen3-30B-A3B 是同一个成因（`Qwen3MoeRotaryEmbedding` 的 buffer 同样落在 cuda:1），
+所以这一个修复同时覆盖两个模型家族。
+
+### 实测结论
+
+| | 单卡 | 双卡（层切分） |
+|---|---|---|
+| 权重分布 | 59 GiB / 1 卡 | 约 30 GiB / 卡（含 KV） |
+| 层的设备 | 全部 cuda:0 | 24 层 cuda:0 / 23 层 cuda:1 |
+| 冒烟输出（round-trip） | 基准 | **逐字一致**（回答文本、分段统计均同） |
+| `reuse_tokens` / `graft_mismatches` | 276 / 0 | 276 / 0 |
+| RoPE 回退告警 | 0 | 0（两张卡都走模型自己的 RoPE 模块） |
+
+KV 复用与拼接链路（`slice_cache`/`tail_cache`/`concat_cache`/`rebase_rope_cache`）全是
+**per-layer** 操作，第 i 层永远配第 i 层，天然同卡，所以双卡下语义不变；MLA 的 value 槽
+旋转在两张卡上分别 rebase，相位与单卡一致。
+
+### 代价
+
+层切分是 pipeline 并行：batch=1 自回归解码时同一时刻只有一张卡在算、另一张空转，层边界
+还要跨卡搬 hidden states，因此是**负优化**（Qwen3-30B-A3B 实测 9.5 → 6.5 tok/s）。对本模型
+只有两个理由值得上双卡：权重 + KV 需要更多显存，或想给 KV 腾空间（单卡 59 GiB 权重压在
+80GB 卡上只剩约 20 GiB）。若目标是吞吐，应改用两进程各占一卡 + 轮询路由 —— KV 复用功能
+原样保留，且吞吐翻倍。
+
 ## 已知边界
 
 - **`--repair-mode context` 不适用于本模型**：分层修复是 Qwen3 专用的
