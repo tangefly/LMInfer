@@ -207,5 +207,31 @@ class Qwen3MoeFallbackTest(unittest.TestCase):
         torch.testing.assert_close(out.logits, expected, atol=1e-6, rtol=1e-5)
 
 
+class SupportReasonDeviceTest(unittest.TestCase):
+    """多卡(层切分)下 context repair 算不了: 它按层直接调 self_attn / mlp, 要求单一设备.
+
+    用 meta 设备当"另一张卡"的替身(与 test_kvcache 的 RoPE 设备测试同一手法),
+    不要求跑测试的机器真有 2 张 GPU。
+    """
+
+    @staticmethod
+    def _dense(*devices):
+        c = Qwen3Config(vocab_size=97, hidden_size=32, intermediate_size=64,
+                        num_hidden_layers=4, num_attention_heads=4,
+                        num_key_value_heads=2, head_dim=8, eos_token_id=96)
+        c._attn_implementation = 'sdpa'
+        model = Qwen3ForCausalLM(c).eval()
+        for layer, device in zip(model.model.layers, devices):
+            layer.to(device)                # device_map 把这些层放到了别的设备
+        return model
+
+    def test_single_device_is_supported(self):
+        self.assertIsNone(support_reason(self._dense()))
+
+    def test_model_split_across_devices_is_rejected(self):
+        reason = support_reason(self._dense("meta"))
+        self.assertEqual(reason, "context repair requires a model resident on one device")
+
+
 if __name__ == '__main__':
     unittest.main()

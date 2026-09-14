@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--dtype", default="auto",
                          choices=["auto", "bfloat16", "float16", "float32"])
+    p_serve.add_argument("--device-map", default="auto",
+                         choices=["auto", "balanced", "balanced_low_0", "sequential", "cuda"],
+                         help="权重放置: auto 按**可见**显存的空闲量平摊到所有可见 GPU"
+                              "(多卡时按层切分, 用 CUDA_VISIBLE_DEVICES 选卡); "
+                              "balanced/balanced_low_0/sequential 是 accelerate 的其余策略"
+                              "(sequential 会顺序填满); cuda 不切分, 整份放当前默认卡")
     p_serve.add_argument("--backend", choices=["transformers", "vllm"], default="transformers",
                          help="推理后端; vllm 为单卡 Qwen3 dense 分段 KV 复用实现")
     p_serve.add_argument("--attn-implementation", default="auto",
@@ -125,7 +131,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # 接受但忽略的 vLLM 兼容参数(显式传了才提示, 便于对照 vLLM 命令)
     for name, desc in [
         ("gpu_memory_utilization", "KV cache 由 transformers 动态分配, 无需预分显存"),
-        ("tensor_parallel_size", "朴素实现只支持单卡"),
+        ("tensor_parallel_size", "朴素实现没有张量并行; 多卡是层切分, 见 --device-map"),
         ("kv_transfer_config", "朴素实现不接入 KV 传输(如 LMCache)"),
     ]:
         if getattr(args, name, None) and args.backend == "transformers":
@@ -146,6 +152,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         gpu_memory_utilization=float(args.gpu_memory_utilization) if args.gpu_memory_utilization is not None else 0.5,
         tensor_parallel_size=int(args.tensor_parallel_size) if args.tensor_parallel_size is not None else 1,
         dtype=args.dtype,
+        device_map=args.device_map,
         attn_implementation=args.attn_implementation,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,

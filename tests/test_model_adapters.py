@@ -17,6 +17,7 @@ from lminfer.model_adapters import (
     RopeLayout,
     _is_finegrained_fp8,
     _supports_causal_lm,
+    device_map_summary,
     kv_bytes_per_token,
     load_text_model,
     resolve_model_profile,
@@ -298,6 +299,49 @@ class ResolveLogitsKwargsTest(unittest.TestCase):
             num_key_value_heads=1, head_dim=8, moe_intermediate_size=8,
             num_experts=2, num_experts_per_tok=1))
         self.assertEqual(model_adapters.resolve_logits_kwargs(model), {"logits_to_keep": 1})
+
+
+class DeviceMapSummaryTest(unittest.TestCase):
+    """启动日志的"权重分布": device_map="auto" 切在哪一层只有加载后才知道.
+
+    用 meta 设备当"另一张卡"的替身(与 test_kvcache 的 RoPE 设备测试同一手法),
+    不要求跑测试的机器真有 2 张 GPU。
+    """
+
+    @staticmethod
+    def _model():
+        from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+        model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+            vocab_size=64, hidden_size=32, num_hidden_layers=4, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=8, moe_intermediate_size=8,
+            num_experts=2, num_experts_per_tok=1))
+        for layer in list(model.model.layers)[2:]:
+            layer.to("meta")            # accelerate 把这两层放到了"另一张卡"
+        return model
+
+    def test_layers_and_size_grouped_per_device(self):
+        summary = device_map_summary(self._model())
+        # 层按设备分别计数(embed / lm_head 不算层), 体积按参数实际 dtype 算
+        self.assertRegex(summary, r"^cpu 2 层/\d+\.\d{2} GiB, meta 2 层/\d+\.\d{2} GiB$")
+
+    def test_single_device_model_has_one_entry(self):
+        from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+        model = Qwen3MoeForCausalLM(Qwen3MoeConfig(
+            vocab_size=64, hidden_size=32, num_hidden_layers=4, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=8, moe_intermediate_size=8,
+            num_experts=2, num_experts_per_tok=1))
+        summary = device_map_summary(model)
+        self.assertNotIn(",", summary)          # 单卡只有一项, 不能看着像切了卡
+        self.assertIn("cpu 4 层/", summary)
+
+    def test_size_is_binary_gib_and_non_layer_params_are_not_counted_as_layers(self):
+        import torch
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([torch.nn.Linear(8, 8, bias=False)])  # cpu
+        # meta 张量不占内存, 可以用它验证 GiB 换算(2**28 个 float32 = 1.00 GiB)
+        model.big = torch.nn.Parameter(torch.empty(2 ** 28, dtype=torch.float32,
+                                                   device="meta"))
+        self.assertEqual(device_map_summary(model), "cpu 1 层/0.00 GiB, meta 1.00 GiB")
 
 
 if __name__ == "__main__":

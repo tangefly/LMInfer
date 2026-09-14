@@ -42,6 +42,7 @@ transformers 后端反量化成普通线性层。这两件事都是模型家族�
 
 import inspect
 import logging
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger("lminfer")
@@ -375,6 +376,41 @@ def kv_bytes_per_token(config, dtype_size: int) -> int:
 # ---------------------------------------------------------------------------
 # 模型加载适配(transformers 后端)
 # ---------------------------------------------------------------------------
+
+# `...layers.<n>.` —— 数每张卡上有多少层变压器层(日志用)
+_LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def device_map_summary(model) -> str:
+    """按设备汇总权重落点: "cuda:0 24 层/28.9 GiB, cuda:1 24 层/28.9 GiB".
+
+    `device_map="auto"` 在**多卡上是按可用显存平摊**的(不是顺序填满), 具体切在哪一层
+    只有加载后才知道 —— 共享节点上不写这行日志就完全看不见, 单卡时也便于确认没被
+    切错。取参数的 `device` 而不是 `hf_device_map`: 后者只有模块名到设备的映射, 层与
+    层之间怎么分、各占多少显存还得自己数; 参数自身的 device 就是实际驻留位置。
+    """
+    per_device: dict[str, tuple[set[int], int]] = {}
+    for name, param in model.named_parameters():
+        device = str(param.device)
+        layers, nbytes = per_device.get(device, (set(), 0))
+        nbytes += param.numel() * param.element_size()
+        match = _LAYER_INDEX.search(name)
+        if match:
+            layers.add(int(match.group(1)))
+        per_device[device] = (layers, nbytes)
+
+    def order(item):
+        # cuda:0 < cuda:1 < ... < cuda:10(按数字而不是字典序), cpu/meta 等排最后
+        device = item[0]
+        prefix, _, tail = device.rpartition(":")
+        return (prefix, int(tail)) if tail.isdigit() else (device, -1)
+
+    parts = []
+    for device, (layers, nbytes) in sorted(per_device.items(), key=order):
+        size = f"{nbytes / 2 ** 30:.2f} GiB"
+        parts.append(f"{device} {len(layers)} 层/{size}" if layers else f"{device} {size}")
+    return ", ".join(parts)
+
 
 # 文本解码器 RoPE 模块的典型位置, 按顺序探测(拼接模式的 RoPE rebase 要用模型
 # 自己的逆频率, 不能假设 theta 直接开方 —— 见 kvcache.rebase_rope_cache)

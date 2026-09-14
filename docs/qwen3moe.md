@@ -160,14 +160,30 @@ OK: Qwen3-30B-A3B-Instruct-2507 子 agent 输出 KV 复用链路跑通
 batch=1、`sdpa`、无连续批处理、无 CUDA Graph —— 这是朴素实现的预期量级；
 MoE 的收益在**权重显存**（30B 参数只激活 3B，但朴素实现仍是全权重常驻）。
 
-## 多卡（`device_map="auto"`）
+## 多卡（`device_map` / 层切分）
 
-设 `CUDA_VISIBLE_DEVICES=0,1` 即可切成两张卡，不需要改代码（`EngineConfig.device_map`
-缺省就是 `"auto"`，CLI 未暴露该参数）。权重 57.7 GiB 按层对半：layers 0..23 在 cuda:0、
-24..47 在 cuda:1。
+设 `CUDA_VISIBLE_DEVICES=2,3` 即可切成两张卡，不需要改代码（`EngineConfig.device_map`
+缺省就是 `"auto"`；`--device-map` 也可在命令行给：`auto` / `balanced` /
+`balanced_low_0` / `sequential` / `cuda`（后者不切分，整份放当前默认卡））。
+权重 56.9 GiB 按层对半：layers 0..23 在 cuda:0、24..47 在 cuda:1 —— 启动日志直接写出
+落点与各卡体积（`cuda:N` 是**进程内**序号，与 nvidia-smi 编号不同）：
+
+```text
+可见 GPU: 2,3(进程内 cuda:0=物理 2, cuda:1=物理 3, 与 nvidia-smi 编号不同)
+权重分布: cuda:0 24 层/28.44 GiB, cuda:1 24 层/28.44 GiB
+多卡为流水线并行(解码时逐层跨卡), 吞吐不叠加; 要吞吐请每张卡起一个进程并加路由
+```
 
 注意 `device_map="auto"` 是**按可用显存平摊到所有可见 GPU**，不是顺序填满：8 卡节点上
-不加 `CUDA_VISIBLE_DEVICES` 会被切成 8 份（实测 4 卡可见时是 12/13/13/10 层）。
+不加 `CUDA_VISIBLE_DEVICES` 会被切成 8 份（实测 4 卡可见时是 12/13/13/10 层），
+要顺序填满得显式 `--device-map sequential`。
+
+`--repair-mode context` 在多卡下不可用：分层修复按层直接调 `layer.self_attn` / `layer.mlp`，
+`context_repair.support_reason` 要求模型驻留在**单一设备**上，否则打印原因并回退
+`exact_prefill`。本模型在这一步**之前**就已因 MoE 回退（双卡实测日志：
+`fallback_reason: context repair requires a dense Qwen3 model with >= 2 layers`），
+所以多卡没有额外影响 —— 复用照常（243/292 token，`graft_mismatches=0`）；
+`window` / `exact` 不受影响。
 
 **一个双卡才暴露的缺陷（已修）**：`Qwen3MoeRotaryEmbedding` 作为单个模块被 accelerate
 整个放在 cuda:1（`inv_freq` buffer 跟着模块走），`rope(probe, positions)` 的输出因此落在
@@ -175,7 +191,7 @@ MoE 的收益在**权重显存**（30B 参数只激活 3B，但朴素实现仍�
 `--graft-rope-rebase` 时 `target * cos` 直接报设备不匹配。修法（`_rope_delta_cos_sin` 显式
 搬回请求的 device）与完整分析见 `docs/glm47.md` 的多卡一节，GLM-4.7-Flash 是同一个成因。
 
-实测（2×H100）：
+首轮实测（2×H100，2026-09-13）：
 
 | | 单卡 | 双卡（层切分） |
 |---|---|---|
@@ -183,10 +199,22 @@ MoE 的收益在**权重显存**（30B 参数只激活 3B，但朴素实现仍�
 | LCP 复用等价性（末位 logits 相对误差） | 3.33e-02 | **3.33e-02（逐位相同）** |
 | decode（batch=1，64 tok） | **9.5 tok/s** | 6.5 tok/s |
 
+2026-09-14 在同一节点上**交错复测**（两个服务同时在线、各 8 次取中位数，避免时钟爬坡
+与邻居噪声把结论带偏）：
+
+| | 单卡 | 双卡（层切分） |
+|---|---|---|
+| decode（64 tok，8 次中位数） | **14.28 tok/s**（11.32–16.43） | 11.08 tok/s（8.12–13.52） |
+| prefill（~17.7K tok prompt） | **1.19 s** | 1.33 s |
+| prefill（~34.0K tok prompt） | **2.70 s** | 4.20 s |
+
 双卡**不引入额外数值误差**（复用等价性与单卡逐位相同，KV 操作全是 per-layer、天然同卡），
-但层切分是 pipeline 并行：batch=1 自回归解码时同一时刻只有一张卡在算，拿不到并行收益，
-反而慢约 46%。上双卡的理由只有显存（权重 57.7 GiB 压一张 80GB 卡只剩约 20 GiB 给 KV）；
-要吞吐应改用两进程各占一卡 + 轮询路由，KV 复用功能原样保留且吞吐翻倍。
+但层切分是 pipeline 并行：batch=1 自回归解码时同一时刻只有一张卡在算，拿不到并行收益 ——
+decode 约为单卡的 78%，长 prompt 的 prefill 也慢（34K 时 1.6 倍，层边界的跨卡搬运在长序列
+上被放大）。**上双卡的理由只有显存**（权重 56.9 GiB 压一张 80GB 卡只剩约 22 GiB 给 KV）；
+要吞吐应该每张卡起一个**单卡进程**，前面加一个把同一 `session_id` 固定到同一进程的
+粘滞路由（会话 KV 存在各自进程里，路由到别的进程既复用不到、还会 404），代价是同一份
+权重的两份副本。
 
 ## 已知边界
 

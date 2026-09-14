@@ -17,6 +17,7 @@
 import asyncio
 import functools
 import logging
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -35,8 +36,9 @@ from transformers import (
 )
 
 from .config import EngineConfig, SamplingParams
-from .model_adapters import (kv_bytes_per_token, load_text_model,
-                             resolve_logits_kwargs, resolve_rotary_emb)
+from .model_adapters import (device_map_summary, kv_bytes_per_token,
+                             load_text_model, resolve_logits_kwargs,
+                             resolve_rotary_emb)
 from .repair import repair_token_counts
 from .context_repair import context_prefill, exact_prefill
 from .kvcache import (
@@ -108,6 +110,13 @@ class LLMEngine:
     # ------------------------------------------------------------------
     def _load_model(self):
         t0 = time.time()
+        # CUDA_VISIBLE_DEVICES 会把物理卡号重映射成进程内的 cuda:0..N-1(多卡选卡就靠它),
+        # 于是"权重分布"里的 cuda:N 与 nvidia-smi 的编号不是一回事 —— 共享节点上必须写清
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if visible and all(part.strip().isdigit() for part in visible.split(",")):
+            logger.info("可见 GPU: %s(进程内 %s, 与 nvidia-smi 编号不同)", visible,
+                        ", ".join(f"cuda:{i}=物理 {part.strip()}"
+                                  for i, part in enumerate(visible.split(","))))
         dtype_map = {"auto": "auto", "bfloat16": torch.bfloat16,
                      "float16": torch.float16, "float32": torch.float32}
         if self.config.dtype not in dtype_map:
@@ -172,6 +181,15 @@ class LLMEngine:
             logger.warning("未找到文本解码器的 RoPE 模块, --graft-rope-rebase 将按"
                            "默认 RoPE 公式重映射(缩放型 RoPE 如 YaRN 会不准确)")
         logger.info("KV cache 每 token 占用(理论): %.2f MiB", self.kv_bytes_per_token / (1024 ** 2))
+        # 权重落点: device_map="auto" 只保证"按可用显存平摊", 层切在哪、每张卡各占多少
+        # 显存只有加载后才知道 —— 共享节点上没这行日志就完全看不见。多卡是流水线并行:
+        # batch=1 解码时同一时刻只有一张卡在算, 层边界还要跨卡搬 hidden states, 因此它
+        # 只用来装下单卡装不下的权重, 换吞吐要靠每卡一个进程(见 README 多卡一节)。
+        logger.info("权重分布: %s", device_map_summary(self.model))
+        devices = {str(param.device) for param in self.model.parameters()}
+        if len(devices) > 1:
+            logger.info("多卡为流水线并行(解码时逐层跨卡), 吞吐不叠加; "
+                        "要吞吐请每张卡起一个进程并加路由")
 
     @property
     def model_config(self):

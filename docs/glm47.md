@@ -182,8 +182,9 @@ WARNING tool-call-parser=hermes 未识别到工具调用(请求 4da04974b378), �
 ## 多卡（`device_map="auto"`）
 
 实测 2×H100 80GB：设 `CUDA_VISIBLE_DEVICES=0,1` 即可，**不需要改任何代码**
-（`EngineConfig.device_map` 缺省就是 `"auto"`，CLI 未暴露该参数）。权重按层切开：
-layers 0..23 在 cuda:0、24..46 在 cuda:1。
+（`EngineConfig.device_map` / `--device-map` 缺省就是 `"auto"`）。权重按层切开：
+layers 0..23 在 cuda:0、24..46 在 cuda:1 —— 启动日志会写出实际落点
+（`权重分布: cuda:0 24 层/... GiB, cuda:1 23 层/... GiB`；`cuda:N` 是进程内序号）。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 -m lminfer serve \

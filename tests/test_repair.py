@@ -31,6 +31,18 @@ class RepairWindowTest(unittest.TestCase):
         args = parser.parse_args(['serve', 'model'])
         self.assertEqual((args.repair_window_begin, args.repair_window_end), (0, 0))
 
+    def test_device_map_cli(self):
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(['serve', 'model']).device_map, 'auto')
+        for strategy in ('balanced', 'balanced_low_0', 'sequential', 'cuda'):
+            with self.subTest(strategy=strategy):
+                args = parser.parse_args(['serve', 'model', '--device-map', strategy])
+                self.assertEqual(args.device_map, strategy)
+                self.assertEqual(EngineConfig(model='model', device_map=strategy).device_map,
+                                 strategy)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(['serve', 'model', '--device-map', 'cuda:0'])
+
     def test_invalid_ratios_rejected_by_cli_and_config(self):
         parser = build_parser()
         for edge in ('begin', 'end'):

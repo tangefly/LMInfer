@@ -400,20 +400,31 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
   arguments 合法，朴素实现只解析不约束，JSON 的合法性依赖模型自身（对
   Qwen3 系模型通常没问题）。
 
-**多卡（`device_map="auto"`）**
+**多卡（`device_map`）**
 
-设 `CUDA_VISIBLE_DEVICES=0,1` 即可把模型按层切到两张卡，**不需要改代码**
-（`EngineConfig.device_map` 缺省就是 `"auto"`，CLI 未暴露该参数）。注意 `auto` 是
+设 `CUDA_VISIBLE_DEVICES=0,1` 即可把模型按层切到两张卡（`--device-map` 缺省 `auto`，
+另外可选 `balanced` / `balanced_low_0` / `sequential` / `cuda`）。注意 `auto` 是
 **按可用显存平摊到所有可见 GPU**，不是顺序填满：8 卡节点上不加该环境变量会被切成 8 份
-（实测 4 卡可见时是 12/13/13/10 层）。
+（实测 4 卡可见时是 12/13/13/10 层）。启动日志直接写出落点（`cuda:N` 是**进程内**序号，
+与 nvidia-smi 编号不同）：
+
+```text
+可见 GPU: 2,3(进程内 cuda:0=物理 2, cuda:1=物理 3, 与 nvidia-smi 编号不同)
+权重分布: cuda:0 24 层/28.44 GiB, cuda:1 24 层/28.44 GiB
+多卡为流水线并行(解码时逐层跨卡), 吞吐不叠加; 要吞吐请每张卡起一个进程并加路由
+```
 
 KV 复用/拼接链路（`slice_cache` / `tail_cache` / `concat_cache` / `rebase_rope_cache`）
 全是 **per-layer** 操作，第 i 层永远配第 i 层，天然同卡，因此双卡下语义不变，也不引入
 额外数值误差（Qwen3-30B-A3B 实测：LCP 复用等价性与单卡**逐位相同**）。
+`--repair-mode context` 除外：分层修复直接调用 `layer.self_attn` / `layer.mlp`，
+要求模型在**单一设备**上，多卡下自动回退 `exact`（`window` / `exact` 不受影响）。
 
 但层切分是 pipeline 并行 —— batch=1 自回归解码时同一时刻只有一张卡在算、另一张空转，
-层边界还要跨卡搬 hidden states，因此是**负优化**（Qwen3-30B-A3B 实测 9.5 → 6.5 tok/s）。
-上双卡的理由只有显存（权重压在单张 80GB 卡上只剩约 20 GiB 给 KV）；要吞吐应改用
+层边界还要跨卡搬 hidden states，**decode 与 prefill 都更慢**（2026-09-14 复测
+Qwen3-30B-A3B，同一节点交错各 8 次：decode 中位数 14.28 → 11.08 tok/s；34K prompt
+prefill 2.70 → 4.20 s）。
+上双卡的理由只有显存（权重 56.9 GiB 压在单张 80GB 卡上只剩约 22 GiB 给 KV）；要吞吐应改用
 两进程各占一卡 + 轮询路由，KV 复用功能原样保留。完整实测、以及一个**双卡才暴露的
 RoPE 设备缺陷**（`_rope_delta_cos_sin` 的输出必须搬回调用方请求的 device）见
 [docs/glm47.md](docs/glm47.md) 与 [docs/qwen3moe.md](docs/qwen3moe.md) 的多卡一节。
