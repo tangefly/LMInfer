@@ -10,6 +10,7 @@ from lminfer.kvcache import (
     TOOL_RESPONSE_OPEN,
     SessionKVStore,
     _rope_delta_cos_sin,
+    move_cache,
     rebase_rope_cache,
 )
 
@@ -255,6 +256,72 @@ class SessionKVStoreTest(unittest.TestCase):
         self.assertIsNotNone(graft)
         self.assertEqual(graft.tokens, [31, 32, 33, 34])
         self.assertEqual(graft.position, 8)
+
+
+class SnapshotOffloadTest(unittest.TestCase):
+    """已保存的 KV 段默认冷存在内存里, 取候选段时才搬回计算设备.
+
+    段只在"请求开始做前缀匹配/拼接"时被读, 属于冷数据: 常驻显存会让 agent 长会话
+    (main 段 + 一批 sub 输出段)把卡占满 —— 实测 GLM-4.7-Flash 的一次 browsecomp
+    研究任务在 main 第 19 个请求 OOM(快照约 8 GiB, 而 vLLM 的池子还占着 15 GiB)。
+    代价是取候选段时多一次 H2D 拷贝。
+    """
+
+    def test_move_cache_is_a_no_op_on_the_same_device(self):
+        cache = make_cache(4)
+        # 同设备必须原样返回: --kv-snapshot-device cuda 的行为与从前逐位一致
+        self.assertIs(move_cache(cache, "cpu"), cache)
+
+    def test_move_cache_copies_across_devices(self):
+        cache = make_cache(4)
+        moved = move_cache(cache, "meta")  # meta 当"另一台设备"的替身(不真占显存)
+        self.assertIsNot(moved, cache)
+        self.assertEqual(moved.layers[0].keys.device.type, "meta")
+        self.assertEqual(tuple(moved.layers[0].keys.shape),
+                         tuple(cache.layers[0].keys.shape))
+
+    def test_move_cache_keeps_unequal_slots(self):
+        # MLA(潜向量 512 / k_rot 64)两槽不等宽, 整体搬运时不能被当成同形处理
+        latent = torch.randn(1, 1, 4, 8)
+        rope = torch.randn(1, 1, 4, 2)
+        cache = DynamicCache(ddp_cache_data=[(latent, rope)], config=None)
+        moved = move_cache(cache, "meta")
+        self.assertEqual(tuple(moved.layers[0].keys.shape), (1, 1, 4, 8))
+        self.assertEqual(tuple(moved.layers[0].values.shape), (1, 1, 4, 2))
+
+    def test_snapshot_stats_reports_where_segments_live(self):
+        store = SessionKVStore(config=None, snapshot_device="cpu")
+        store.put("s", KIND_MAIN, [1, 2], make_cache(2))
+        store.put("s", KIND_SUB, [1, 2, 3], make_cache(3), prompt_len=2)
+        stats = store.snapshot_stats()
+        self.assertEqual(stats["segments"], 2)
+        # 只报 cpu 一项才说明冷存生效(出现 cuda 就表示段还在显存里)
+        self.assertEqual(list(stats["bytes_by_device"]), ["cpu"])
+        self.assertEqual(stats["bytes_by_device"]["cpu"], 2 * (2 * 2 * 4) + 2 * (3 * 2 * 4))
+
+    def test_store_learns_the_compute_device_from_put(self):
+        store = SessionKVStore(config=None, snapshot_device="cpu")
+        self.assertIsNone(store._compute_device)
+        store.put("s", KIND_MAIN, [1, 2], make_cache(2))
+        self.assertEqual(store._compute_device.type, "cpu")
+        self.assertEqual(store._segments["s"]["main"].cache.layers[0].keys.device.type,
+                         "cpu")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "需要 GPU 验证真实的跨设备冷存")
+    def test_gpu_snapshot_round_trip(self):
+        store = SessionKVStore(config=None, snapshot_device="cpu")
+        keys = torch.arange(8, dtype=torch.float32, device="cuda").reshape(1, 1, 4, 2)
+        values = keys + 1000
+        store.put("s", KIND_MAIN, [1, 2, 3, 4],
+                  DynamicCache(ddp_cache_data=[(keys, values)], config=None),
+                  trace=["main"])
+        # 存下去的是内存副本(显存随之释放)…
+        stored = store._segments["s"]["main"].cache
+        self.assertEqual(stored.layers[0].keys.device.type, "cpu")
+        # …取候选段时搬回计算设备, 内容逐位不变
+        [candidate] = store.propose("s", ["main"])
+        self.assertEqual(candidate.cache.layers[0].keys.device.type, "cuda")
+        torch.testing.assert_close(candidate.cache.layers[0].values.cpu(), values.cpu())
 
 
 class MistralFakeTokenizer:

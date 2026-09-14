@@ -294,8 +294,24 @@ Available KV cache memory: 15.03 GiB / GPU KV cache size: 298,096 tokens
 
 ### 显存
 
-权重 55.87 GiB（vLLM 实测，比 transformers 后端的常驻读数小）+ paged KV 15.03 GiB
-（`--gpu-memory-utilization 0.9`，容量 298,096 token），单张 80GB 卡可跑。
+权重 55.87 GiB（vLLM 实测，比 transformers 后端的常驻读数小）。池子按"刚好装下
+`--max-model-len` 一条序列"设即可（81920 × 54,144 B ≈ 4.13 GiB），
+`--gpu-memory-utilization 0.80` 实测池子 5.96 GiB，单张 80GB 卡跑得下；
+给 0.9（池子 15 GiB）反而会在长 agent 会话里 OOM。详见
+[vLLM 后端说明的显存一节](vllm_backend.md#显存-池子只要装得下一条序列-快照放内存)。
+
+### 真实 agent 工作负载（browsecomp-plus 研究任务）
+
+用 `python3 scripts/research/run_research.py --index 0 ... --model exp-model`
+（BenchAgent，走 `/v1/chat/completions` 的 agent 模式）在这个后端上跑完整样本：
+
+- **跑通**，答案 `Queen Arwa University` 与 gold 一致（rouge1/rougeL/token_f1/exact_match 全 1.0）；
+- 全程 34 个请求，KV 复用 44 次尝试 / 22 次命中 / 复用 64,104 token，**拼接失配 0**；
+- 默认的 `--kv-snapshot-device cpu` 让段落在内存里（实测一个 `main -> sub -> main`
+  来回的段 12.5 MiB，`/v1/stats` 的 `kv_snapshot.bytes_by_device` 只报 `cpu`）。
+
+第一次跑（`--gpu-memory-utilization 0.9`）在第 19 个请求 OOM，挂在 `stage.finish`
+构造 `DynamicCache` 上 —— 池子占了 15 GiB，快照和当轮工作集的余量不够。
 
 ## 已知边界
 

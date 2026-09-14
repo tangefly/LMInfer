@@ -107,6 +107,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--repair-min-ratio", type=repair_ratio, default=0.05)
     p_serve.add_argument("--repair-probe-tokens", type=int, default=8)
     p_serve.add_argument("--repair-probe-threshold", type=float, default=0.0)
+    p_serve.add_argument("--kv-snapshot-device", choices=["cpu", "cuda"], default="cpu",
+                         help="已保存 KV 段的存放设备(默认 cpu): agent 会话的段只在请求开始"
+                              "做前缀匹配/拼接时才读, 属于冷数据, 放内存可以把显存留给当前"
+                              "这次推理(代价是取候选段时多一次 H2D 拷贝); cuda 让段常驻显存")
     p_serve.add_argument("--kv-segment-idle-ttl", type=float, default=None,
                          help="已保存 KV 段的会话闲置超时秒数(默认 3600): 会话闲置超过该时长, "
                               "其全部 KV 段被清理释放显存. 0 表示不清理")
@@ -176,6 +180,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         repair_probe_tokens=args.repair_probe_tokens,
         repair_probe_threshold=args.repair_probe_threshold,
         kv_segment_idle_ttl=args.kv_segment_idle_ttl if args.kv_segment_idle_ttl is not None else 3600.0,
+        kv_snapshot_device=args.kv_snapshot_device,
     )
     logger.info("启动服务: %s:%d (模型 %s)", args.host, args.port, args.model)
     run_server(config, host=args.host, port=args.port)

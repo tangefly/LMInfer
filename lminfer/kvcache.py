@@ -49,7 +49,7 @@ AgentSessionRegistry 相同), 无需加锁; 生成循环线程只持有深拷贝
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -340,6 +340,26 @@ def concat_cache(a: DynamicCache, b: DynamicCache, config) -> DynamicCache:
     return DynamicCache(ddp_cache_data=layers, config=config)
 
 
+def move_cache(cache: DynamicCache, device) -> DynamicCache:
+    """把一份 KV 快照整体搬到另一个设备(冷存到内存 / 取回 GPU 参与拼接).
+
+    逐层独立搬运, 所以 MLA 的两个槽不等宽也不受影响; 目标设备与当前一致时
+    **原样返回**(不复制), 保证 `--kv-snapshot-device cuda` 时行为与从前完全一致。
+    """
+    if cache is None:
+        return cache
+    target = torch.device(device)
+    if all(layer.is_initialized and layer.keys.device == target
+           and layer.values.device == target for layer in cache.layers):
+        return cache
+    layers = []
+    for layer in cache.layers:
+        if not layer.is_initialized:
+            raise ValueError("cannot move an uninitialized KV cache")
+        layers.append((layer.keys.to(target), layer.values.to(target)))
+    return DynamicCache(ddp_cache_data=layers, config=getattr(cache, "config", None))
+
+
 def longest_common_prefix(a: list[int], b: list[int]) -> int:
     """两个 token 序列的最长公共前缀长度(逐元素比较)."""
     i = 0
@@ -360,11 +380,17 @@ class SessionKVStore:
       已被 main 段覆盖.
     """
 
-    def __init__(self, config=None, tokenizer=None, idle_ttl: float = 3600.0) -> None:
+    def __init__(self, config=None, tokenizer=None, idle_ttl: float = 3600.0,
+                 snapshot_device: str = "cpu") -> None:
         # session_id -> {"main": KVPrefix | None, "subs": list[KVPrefix]}
         self._segments: dict[str, dict[str, Any]] = {}
         self._last_seen: dict[str, float] = {}  # session_id -> 最近一次 put 时间(闲置清理用)
         self._idle_ttl = idle_ttl
+        # 快照冷存设备(默认内存): 段只在"请求开始做前缀匹配/拼接"时才需要, 属于冷数据,
+        # 没理由常驻显存 —— GPU 上只留当前这次推理真正要用的 KV。计算设备从 put 进来的
+        # cache 推断(引擎的 cache 就是计算设备上的), 取候选段时按同一设备搬回去。
+        self._snapshot_device = torch.device(snapshot_device)
+        self._compute_device: torch.device | None = None
         self._stats = {"reuse_attempts": 0, "reuse_hits": 0, "reuse_tokens": 0,
                        "graft_mismatches": 0}
         # 拼接 cache 时需要模型 config 构造 DynamicCache(server 传入 engine.model_config)
@@ -401,6 +427,17 @@ class SessionKVStore:
                                 "(open id %s, terminator ids %s)",
                                 wrapper.open_marker, list(wrapper.terminators),
                                 self._resp_marker_ids[0], list(self._terminator_ids))
+
+    def _to_compute_device(self, segments, attr: str = "cache"):
+        """把冷存的候选段搬回计算设备后才交给引擎.
+
+        `move_cache` 在设备已经一致时不复制(原样返回), 所以
+        `--kv-snapshot-device cuda` 下这里等于什么都没做。
+        """
+        if not segments or self._compute_device is None:
+            return segments
+        return [replace(seg, **{attr: move_cache(getattr(seg, attr), self._compute_device)})
+                for seg in segments]
 
     def _prune_idle(self, now: float) -> None:
         """清理闲置超过 idle_ttl 的会话段(会话注册表本身无 TTL, 这里兜底防显存泄漏).
@@ -475,6 +512,10 @@ class SessionKVStore:
         now = time.time()
         self._prune_idle(now)
         self._last_seen[session_id] = now
+        if cache.layers and cache.layers[0].is_initialized:
+            # 进来的 cache 在计算设备上: 记下来, 将来取候选段时搬回去
+            self._compute_device = cache.layers[0].keys.device
+        cache = move_cache(cache, self._snapshot_device)
         segs = self._segments.setdefault(session_id, {"main": None, "subs": []})
         trace_key = tuple(trace) if trace else None
         prefix = KVPrefix(seq_tokens, cache, output_start=prompt_len,
@@ -660,7 +701,7 @@ class SessionKVStore:
             logger.info("会话 %s: 共定位 %d/%d 个 tool response, 生成 %d 个 KV 片段"
                         "(候选 sub 段 %d 个), 准备多段拼接",
                         session_id, matched_windows, len(windows), len(grafts), len(subs))
-        return grafts
+        return self._to_compute_device(grafts, attr="cache")
 
     def build_graft(self, session_id: str, trace: list[str],
                     prompt_tokens: list[int]) -> KVGraft | None:
@@ -705,10 +746,10 @@ class SessionKVStore:
             subs = segs.get("subs")
             if isinstance(subs, list):
                 candidates.extend(subs)          # 最新 main 后的所有 sub 段
-            return candidates
+            return self._to_compute_device(candidates)
         subs = segs.get("subs")
         if isinstance(subs, list) and subs:
-            return [subs[-1]]  # sub 请求: 最近 sub 段(续接时可复用)
+            return self._to_compute_device([subs[-1]])  # sub 请求: 最近 sub 段
         return []
 
     def note_hit(self, reused_tokens: int) -> None:
@@ -723,3 +764,25 @@ class SessionKVStore:
     @property
     def stats(self) -> dict:
         return dict(self._stats)
+
+    def snapshot_stats(self) -> dict:
+        """当前冷存段的占用(按设备分开计), 供 /v1/stats 观察显存/内存分布.
+
+        `--kv-snapshot-device cpu` 生效时这里应当只有 `cpu` 一项 —— 一个常驻
+        `cuda` 数字就说明段还在显存里, 该查 put/propose 的设备推断。
+        """
+        by_device: dict[str, int] = {}
+        segments = 0
+        for segs in self._segments.values():
+            for seg in [segs.get("main")] + list(segs.get("subs") or []):
+                if not isinstance(seg, KVPrefix):
+                    continue
+                segments += 1
+                for layer in seg.cache.layers:
+                    if not layer.is_initialized:
+                        continue
+                    device = str(layer.keys.device)
+                    size = (layer.keys.numel() + layer.values.numel()) * layer.keys.element_size()
+                    by_device[device] = by_device.get(device, 0) + size
+        return {"segments": segments,
+                "bytes_by_device": {d: n for d, n in sorted(by_device.items())}}

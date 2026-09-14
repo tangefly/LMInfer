@@ -59,6 +59,10 @@ class EngineConfig:
     repair_probe_threshold: float = 0.0  # 深层相对 KV 偏差阈值; 0 禁用精确回退
     kv_segment_idle_ttl: float = 3600.0  # 已保存 KV 段的会话闲置超时(秒): 超过后整段清理,
                                          # 防止会话注册表无 TTL 导致 KV 显存随会话永久增长
+    kv_snapshot_device: str = "cpu"     # 已保存 KV 段的存放设备(cpu/cuda): 段是冷数据 ——
+                                        # 只在请求开始做前缀匹配/拼接时才读, 默认放内存, GPU 上
+                                        # 只留当前这次推理要用的 KV(取候选段时多一次 H2D 拷贝);
+                                        # cuda 保持段常驻显存(旧行为, 长会话容易 OOM)
 
 
     backend: str = "transformers"
@@ -83,6 +87,8 @@ class EngineConfig:
         self.repair_window_end = repair_ratio(self.repair_window_end)
         if self.repair_mode not in ("window", "context", "exact"):
             raise ValueError("repair_mode must be window, context or exact")
+        if self.kv_snapshot_device not in ("cpu", "cuda"):
+            raise ValueError("kv_snapshot_device must be cpu or cuda")
         for name in ("repair_budget", "repair_coverage", "repair_min_ratio"):
             setattr(self, name, repair_ratio(getattr(self, name)))
         if self.repair_min_ratio > self.repair_budget:

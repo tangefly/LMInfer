@@ -170,7 +170,8 @@ def create_app(engine: LLMEngine) -> FastAPI:
     # (多模态包装的顶层 config 没有 num_hidden_layers/rope_parameters)
     kv_store = SessionKVStore(config=engine.model_config,
                               tokenizer=engine.tokenizer,
-                              idle_ttl=engine.config.kv_segment_idle_ttl)
+                              idle_ttl=engine.config.kv_segment_idle_ttl,
+                              snapshot_device=engine.config.kv_snapshot_device)
 
     # ------------------------------------------------------------------
     # 辅助函数: 构造 OpenAI 格式响应
@@ -594,6 +595,9 @@ def create_app(engine: LLMEngine) -> FastAPI:
             "max_model_len": engine.config.max_model_len,
             **engine._stats,
             "kv_reuse": kv_store.stats,
+            # 已保存段的冷存占用(按设备): 用来确认 --kv-snapshot-device cpu 真的生效,
+            # 以及 agent 长会话里显存/内存各被占了多少
+            "kv_snapshot": kv_store.snapshot_stats(),
         }
         
     @app.post("/v1/release")

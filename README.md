@@ -92,11 +92,14 @@ lminfer serve /public/home/xiaoxunpeng/Models/GLM-4.7-Flash \
     --no-enable-thinking \
     --enable-auto-tool-choice --port 8000
 
-# 同一个模型换 vLLM 后端(MLA 走 FLASH_ATTN_MLA; 显存预算必须给足 58 GiB 权重)
+# 同一个模型换 vLLM 后端(MLA 走 FLASH_ATTN_MLA)
+# 0.80 而不是 0.9: vLLM 的 KV 池是预分配的, 串行引擎只要装得下 max_model_len
+# 那一条序列(81920 x 54KB ≈ 4.13 GiB), 池子多占的显存正是快照需要的
 CUDA_VISIBLE_DEVICES=5 lminfer serve /public/home/xiaoxunpeng/Models/GLM-4.7-Flash \
-    --backend vllm --gpu-memory-utilization 0.9 --max-model-len 40960 \
+    --backend vllm --gpu-memory-utilization 0.80 --max-model-len 81920 \
     --reuse-agent-kv-append --graft-rope-rebase \
     --repair-window-begin 0.1 --repair-window-end 0.1 \
+    --kv-snapshot-device cpu \
     --no-enable-thinking \
     --enable-auto-tool-choice --port 8000
 
@@ -602,6 +605,12 @@ KV 首尾的重计算比例。例如匹配到 100 token 时，首部重算 15 �
 与 `--reuse-agent-kv`（LCP 模式）的关系：拼接模式是 LCP 模式的超集 ——
 main 历史仍按 LCP 精确复用，定位失败时自动回退到 LCP 行为，因此单独开
 `--reuse-agent-kv-append` 即可同时获得两者收益。
+
+已保存的段是**冷数据**（只在请求开始做前缀匹配/拼接时才读），默认放在**内存**里
+（`--kv-snapshot-device cpu`），GPU 上只留当前这次推理真正要用的 KV：agent 长会话
+（main 段 + 一批 sub 输出段）会随会话增长把显存吃满，搬回 GPU 时多一次 H2D 拷贝。
+`--kv-snapshot-device cuda` 恢复"段常驻显存"的旧行为；`/v1/stats` 的
+`kv_snapshot.bytes_by_device` 报告段实际落在哪个设备上。
 
 `--graft-rope-rebase` 在插入前把子输出里**带位置的那个张量**从子上下文位置重映射到
 main prompt 的插入位置（普通注意力是 K；MLA 如 GLM-4.7-Flash 是缓存 value 槽里的

@@ -103,6 +103,31 @@ main prompt:
 
 这种实现无需把“有洞的 prompt”伪装成连续命中，也无需更改 attention mask：每次真正执行的 query 都是连续后缀。首尾重算 token 看见的是其真实位置之前的 KV。未来若要减少分段调度和重复拷贝，可将这些区间进一步接入 scheduler 的同一请求生命周期。
 
+## 显存: 池子只要装得下一条序列, 快照放内存
+
+vLLM 的 paged KV 池是**预分配**的, 而 LMInfer 的 agent KV 段在池子之外, 两者抢同一张卡。
+按 MLA 的用量算, 每 token 全 47 层合计 54,144 B, 一条 `--max-model-len` 的序列
+只需要 `max_model_len × 54,144 B`: 81920 → **4.13 GiB**。串行执行的引擎再大的池子
+也用不上, 而池子每多占 1 GiB, 快照就少 1 GiB。
+
+两条规则:
+
+1. **`--gpu-memory-utilization` 按"权重 + 恰好装下 max_model_len 的池子"设。**
+   GLM-4.7-Flash 权重 55.87 GiB + 81920 的池子 → 0.80(池子实测 5.96 GiB)。
+   用默认的 0.9 会让池子吃到 15 GiB, 一次 browsecomp 研究任务跑到第 19 个请求
+   就会 OOM(实测, 挂在 `stage.finish` 构造 `DynamicCache` 上)。
+2. **`--kv-snapshot-device cpu`(默认)** 把已保存的会话段放在内存里, 只在请求开始
+   做前缀匹配/拼接时搬回 GPU。段是冷数据 —— 实测 `main -> sub -> main` 一个来回
+   的段共 12.5 MiB, 全部落在 `cpu`, 整轮会话只花掉 0.2 GiB 显存。代价是取候选段时
+   多一次 H2D 拷贝。`--kv-snapshot-device cuda` 恢复旧的"段常驻显存"行为。
+
+`/v1/stats` 的 `kv_snapshot.bytes_by_device` 用来确认这件事: 只出现 `cpu` 才说明冷存
+生效(出现 `cuda` 就表示段还在显存里)。
+
+注意**驱动层看到的"空闲显存"不等于可用显存**: PyTorch 释放的块留在自己的分配器缓存里,
+`nvidia-smi` / `mem_get_info` 仍显示为已用。上面那次 0.9 池子的 OOM 日志里
+`77.12 GiB 已分配 / 1.31 GiB 已保留未分配`, 说明当时确实是**活的张量**超了, 不是缓存假象。
+
 ## 缓存语义和统计
 
 - 源 KV 快照拥有独立存储，vLLM 请求结束释放 paged blocks 后不会悬空。

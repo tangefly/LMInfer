@@ -180,8 +180,14 @@ class Stage:
         if len(lengths) != 1:
             raise RuntimeError("Captured KV layers have different lengths")
         length = lengths.pop()
-        layers = [(self.layers[i][0][:, :, :length].clone(),
-                   self.layers[i][1][:, :, :length].clone())
+        # 这里**不要** clone: DynamicCache.__init__ 会把每个槽 cat 进自己的空张量
+        # (DynamicLayer.update -> torch.cat), 那一步已经复制了一份。再 clone 一份
+        # 会让每层快照的瞬时占用翻倍 —— 47 层 MLA 下这正是 agent 长会话 OOM 的来源
+        # (实测: main 第 19 个请求, 分配 38 MiB 时整卡只剩 28 MiB)。
+        # 独立性由 test_snapshot_prefix_chunked_capture_and_ownership 守住:
+        # 若将来 DynamicCache 改成持有引用而不复制, 那条用例会失败。
+        layers = [(self.layers[i][0][:, :, :length],
+                   self.layers[i][1][:, :, :length])
                   for i in range(self.num_layers)]
         return DynamicCache(ddp_cache_data=layers, config=config)
 
