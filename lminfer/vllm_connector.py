@@ -21,6 +21,10 @@ class AgentKVConnector(KVConnectorBase_V1):
             raise RuntimeError("LMInfer connector requires VLLM_ENABLE_V1_MULTIPROCESSING=0")
         self.bridge = BRIDGES[bridge_id]
         self.blocks = {}
+        # MLA 家族的分页 cache 尾维是 [压缩潜向量 | k_rot] 紧邻拼接, 读回来时
+        # 需要 kv_lora_rank 作为切分点(写回时由张量自身宽度决定, 见 write_paged)
+        self.latent_dim = getattr(vllm_config.model_config.hf_text_config,
+                                  "kv_lora_rank", None)
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config):
@@ -88,7 +92,8 @@ class AgentKVConnector(KVConnectorBase_V1):
 
     def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
         for blocks, start, end, _ in self._get_connector_metadata().operations:
-            keys, values = read_paged(kv_layer, blocks, start, end, self.block_size)
+            keys, values = read_paged(kv_layer, blocks, start, end, self.block_size,
+                                      self.latent_dim)
             self.bridge.stage.save(layer_index(layer_name), keys, values, start, end)
 
     def wait_for_save(self):

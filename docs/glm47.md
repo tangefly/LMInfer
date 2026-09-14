@@ -3,6 +3,7 @@
 本文记录把 `zai-org/GLM-4.7-Flash`（本机路径
 `/public/home/xiaoxunpeng/Models/GLM-4.7-Flash`）接到 LMInfer 的 Transformers 后端、
 并跑通 **SubAgent Output KV Reuse** 所做的改动与实测证据。
+[vLLM 后端](#vllm-后端)后来也接上了（MLA 的分页布局适配），见下文。
 
 这个模型与前面几个家族的差异在**两个互不相干的轴上**：
 
@@ -240,6 +241,62 @@ KV 复用与拼接链路（`slice_cache`/`tail_cache`/`concat_cache`/`rebase_rop
 80GB 卡上只剩约 20 GiB）。若目标是吞吐，应改用两进程各占一卡 + 轮询路由 —— KV 复用功能
 原样保留，且吞吐翻倍。
 
+## vLLM 后端
+
+同一套 KV 复用/拼接逻辑在 vLLM 后端也跑通了（vLLM 0.27.1、单卡 H100 PCIe）。
+LMInfer 侧只加了布局适配，**`kvcache.py` / `vllm_plan.py` / `server.py` 一行没改** ——
+MLA 的语义本来就集中在 `RopeLayout`（只转 value 槽）与 KV 槽约定里。
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python3 -m lminfer serve \
+  /public/home/xiaoxunpeng/Models/GLM-4.7-Flash \
+  --backend vllm --gpu-memory-utilization 0.9 --max-model-len 40960 \
+  --reuse-agent-kv-append --graft-rope-rebase \
+  --repair-window-begin 0.1 --repair-window-end 0.1 \
+  --no-enable-thinking --enable-auto-tool-choice --port 8010
+```
+
+### 三处适配
+
+| 位置 | 改动 |
+|---|---|
+| `vllm_bridge.py` | 识别 vLLM 的三种分页布局；MLA 的 `(blocks, block_size, kv_lora_rank + qk_rope_head_dim)` 尾维按 `[潜向量 \| k_rot]` 拆成 keys/values 两槽（与 transformers 后端的槽约定一致）；`Stage` 的两个槽**各自**按自身宽度分配缓冲（原先用 keys 的形状建 values，512/64 不等宽会写错） |
+| `vllm_engine.py` | `validate_model` 放行 MLA 家族；attention 后端按家族选 `FLASH_ATTN_MLA`（给 `FLASH_ATTN` 会被 vLLM 判 "MLA not supported"，不会自动映射）；`_validate_cache` 改用 `model_adapters.kv_slot_shapes` 校验不等宽两槽 |
+| `vllm_connector.py` | 读回分页 cache 时把 `kv_lora_rank` 作为拆分点传进去 |
+
+`model_adapters.kv_slot_shapes` 是新增的小工具（家族公式只留一份），其余是布局分支。
+
+### 实测证据（`experiments/vllm_glm47_agent_kv_smoke.py`）
+
+启动日志：
+
+```text
+vLLM backend: glm4_moe_lite, serialized requests, eager FLASH_ATTN_MLA; global prefix caching disabled to isolate approximate KV
+Model loading took 55.87 GiB memory and 49.185168 seconds
+Available KV cache memory: 15.03 GiB / GPU KV cache size: 298,096 tokens
+```
+
+快照形状实测 `keys (1, 1, L, 512)`、`values (1, 1, L, 64)`（bf16），47/47 层全部捕获。
+
+| 用例 | 结果 |
+|---|---|
+| 精确前缀复用 | prompt 180 tok 复用 164 tok，TTFT 166 → 99 ms |
+| 同上下文两段拼接 | 3 段、拼接 72 tok，输出与全量 greedy 逐位一致 |
+| 跨位置拼接（子 agent 输出） | 拼接 27 tok；潜向量槽逐位不变、`k_rot` 等于按目标位置重映射的结果，且显式检查过 rebase 不是空操作 |
+| `exact` 回退 | `reused_prompt_tokens=0`、`exact=True` |
+| chunked prefill | 531 tok 前缀整段命中 |
+| HTTP 两轮 sub→main | 拼接 54 tok、3 段，`exact_prefix_len < prompt_tokens` |
+| 快照释放 | main decode 之前原始 sub KV 已销毁（约 9.7 MiB） |
+
+结果文件见 [artifacts/vllm_glm47_agent_kv_smoke.json](../artifacts/vllm_glm47_agent_kv_smoke.json)；
+同一版本 vLLM 上 Qwen3-8B 的原验收脚本也全绿（走 4 维 packed 布局），见
+[vLLM 后端说明](vllm_backend.md#验证)。
+
+### 显存
+
+权重 55.87 GiB（vLLM 实测，比 transformers 后端的常驻读数小）+ paged KV 15.03 GiB
+（`--gpu-memory-utilization 0.9`，容量 298,096 token），单张 80GB 卡可跑。
+
 ## 已知边界
 
 - **`--repair-mode context` 不适用于本模型**：分层修复是 Qwen3 专用的
@@ -252,10 +309,8 @@ KV 复用与拼接链路（`slice_cache`/`tail_cache`/`concat_cache`/`rebase_rop
   请求 83cf1b16d1c1: 会话 ... KV 前缀复用 239 tok(prompt 289 tok, 跳过 83% prefill)
   ```
 
-  `--repair-mode window`（默认，跳过 96%）/ `exact` 可用。
-- **`--backend vllm` 尚未支持本模型**：`vllm_engine.validate_model` 目前只接受非量化、
-  默认 RoPE 的 dense Qwen3；另外 vLLM 后端按 `(1, num_key_value_heads, len, head_dim)`
-  写分页 KV，对 MLA 的压缩潜向量不成立。会启动即报错退出，不会静默降级。
+  `--repair-mode window`（默认，跳过 96%）/ `exact` 可用。vLLM 后端同理，
+  `--repair-mode context` 在配置层就被拒（`EngineConfig.__post_init__`）。
 - **参数值一律是字符串**：与 vLLM 的 glm47 一致（那套 parser 也按字符串收集
   `<arg_value>`），客户端要数字/对象需自行转换。例外：schema 声明 `type: array` 且值
   是可解析的 Python 字面量时，会按 schema 修成真正的数组（修复改变参数时 arguments

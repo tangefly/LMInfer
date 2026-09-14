@@ -605,7 +605,8 @@ class Glm4MoeLiteRopeRebaseTest(unittest.TestCase):
     `layer.keys = kv_nope [b, 1, s, kv_lora_rank]`(位置无关) +
     `layer.values = k_rot [b, 1, s, qk_rope_head_dim]`(**唯一带位置的张量**, 由
     `apply_rotary_pos_emb_interleave` 在写入缓存前旋转)。所以位置重映射必须转
-    value 槽、且用奇偶交错配对 —— 旧的"转 key 槽 + 前后对半"实现转的是位置无关的
+    value 槽、且按缓存的**前后对半**配对(`rope_interleave` 描述的是输入侧布局,
+    写缓存前已经重排过) —— 旧的"转 key 槽 + 前后对半"实现转的是位置无关的
     潜向量, 真正该转的张量纹丝不动(静默算错, 不报任何错)。
     """
 
@@ -656,6 +657,32 @@ class Glm4MoeLiteRopeRebaseTest(unittest.TestCase):
 
         torch.testing.assert_close(rebased.layers[0].values, at_target,
                                    atol=1e-5, rtol=1e-5)
+
+    def test_default_formula_matches_the_model_on_real_dimensions(self):
+        # vLLM 后端进程里没有 HF 模型对象(vllm_engine 只有 config 桩), 所以
+        # _prefill_reuse 调用 rebase 时传不了 rope= 模块, 只能走默认公式。
+        # 这条断言把那个调用点的相位钉死, 用模型的真实维度(512/64, theta 1e6):
+        # 默认公式与模型自己的 RoPE 只差 float32 舍入(实测 2.4e-07, k_rot 量级 3.1)。
+        from transformers import Glm4MoeLiteConfig
+        from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+            Glm4MoeLiteRotaryEmbedding,
+        )
+        config = Glm4MoeLiteConfig(qk_rope_head_dim=64, kv_lora_rank=512,
+                                   rope_parameters={"rope_theta": 1e6,
+                                                    "rope_type": "default"})
+        rope = Glm4MoeLiteRotaryEmbedding(config)
+        torch.manual_seed(0)
+        latent = torch.randn(1, 1, self.LENGTH, 512)
+        values = torch.randn(1, 1, self.LENGTH, 64)
+
+        rebased = rebase_rope_cache(
+            self._cache(latent, self._values_at(rope, values, self.SOURCE)),
+            self.SOURCE, self.TARGET, config)
+
+        torch.testing.assert_close(rebased.layers[0].values,
+                                   self._values_at(rope, values, self.TARGET),
+                                   atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(rebased.layers[0].keys, latent)
 
     def test_position_independent_latent_is_untouched(self):
         # 潜向量不参与旋转: rebase 必须逐位保留(它本来就不随位置变)

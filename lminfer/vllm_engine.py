@@ -19,6 +19,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from .engine import GenerationResult, LLMEngine
 from .kvcache import KVGraft, concat_cache, rebase_rope_cache, slice_cache, tail_cache
+from .model_adapters import MLA_MODEL_TYPES, kv_slot_shapes
 from .toolcalls import THINK_END, THINK_START
 from .vllm_bridge import BRIDGES, Bridge, Stage
 from .vllm_plan import plan_prefill
@@ -26,9 +27,27 @@ from .vllm_plan import plan_prefill
 logger = logging.getLogger("lminfer")
 
 
+SUPPORTED_MODEL_TYPES = ("qwen3",) + MLA_MODEL_TYPES
+
+
+def is_mla_model(config) -> bool:
+    return str(getattr(config, "model_type", "") or "").lower() in MLA_MODEL_TYPES
+
+
+def attention_backend_name(config) -> str:
+    """按家族选 vLLM 的 attention 后端名.
+
+    MLA 模型**必须**用 `FLASH_ATTN_MLA`: 传 `FLASH_ATTN` 会被 vLLM 的
+    `validate_configuration` 直接判为 "MLA not supported" 并抛错(不会自动映射)。
+    """
+    return "FLASH_ATTN_MLA" if is_mla_model(config) else "FLASH_ATTN"
+
+
 def validate_model(config):
-    if config.model_type != "qwen3":
-        raise ValueError("vllm agent KV backend currently supports dense Qwen3 only")
+    model_type = str(getattr(config, "model_type", "") or "").lower()
+    if model_type not in SUPPORTED_MODEL_TYPES:
+        raise ValueError("vllm agent KV backend supports dense Qwen3 and MLA "
+                         f"(glm4_moe_lite) only, got {model_type or 'unknown'}")
     if getattr(config, "quantization_config", None):
         raise ValueError("Quantized models are not supported by this backend")
     if getattr(config, "use_sliding_window", False) or any(
@@ -77,7 +96,7 @@ class VLLMEngine(LLMEngine):
                 enable_prefix_caching=False,
                 enable_chunked_prefill=True,
                 async_scheduling=False,
-                attention_config={"backend": "FLASH_ATTN"},
+                attention_config={"backend": attention_backend_name(model_config)},
                 kv_transfer_config=KVTransferConfig(
                     kv_connector="AgentKVConnector", kv_role="kv_both",
                     kv_connector_module_path="lminfer.vllm_connector",
@@ -96,8 +115,9 @@ class VLLMEngine(LLMEngine):
         self.model_name = config.served_model_name or config.model.rstrip("/").split("/")[-1]
         self._stats = {"completed": 0, "generated_tokens": 0, "prefill_tokens": 0}
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lminfer-vllm")
-        logger.info("vLLM backend: dense Qwen3, serialized requests, eager FLASH_ATTN; "
-                    "global prefix caching disabled to isolate approximate KV")
+        logger.info("vLLM backend: %s, serialized requests, eager %s; "
+                    "global prefix caching disabled to isolate approximate KV",
+                    model_config.model_type, attention_backend_name(model_config))
 
     def close(self):
         self.executor.shutdown(wait=True)
@@ -111,12 +131,13 @@ class VLLMEngine(LLMEngine):
     def _validate_cache(self, cache):
         c = self.model.config
         length = cache.get_seq_length()
-        expected = (1, c.num_key_value_heads, length, c.head_dim)
+        # MLA 的两个槽不等宽(潜向量 512 / k_rot 64), 形状由家族决定
+        key_shape, value_shape = kv_slot_shapes(c, length)
         if len(cache.layers) != c.num_hidden_layers:
             raise ValueError("KV layer count does not match the model")
         for layer in cache.layers:
-            if (not layer.is_initialized or tuple(layer.keys.shape) != expected
-                    or tuple(layer.values.shape) != expected
+            if (not layer.is_initialized or tuple(layer.keys.shape) != key_shape
+                    or tuple(layer.values.shape) != value_shape
                     or layer.keys.dtype != self.model.dtype
                     or layer.values.dtype != self.model.dtype):
                 raise ValueError("KV snapshot shape/dtype does not match the model")

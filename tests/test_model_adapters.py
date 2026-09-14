@@ -19,6 +19,7 @@ from lminfer.model_adapters import (
     _supports_causal_lm,
     device_map_summary,
     kv_bytes_per_token,
+    kv_slot_shapes,
     load_text_model,
     resolve_model_profile,
     resolve_rope_layout,
@@ -279,6 +280,16 @@ class Glm4MoeLiteFamilyTest(unittest.TestCase):
         self.assertEqual(kv_bytes_per_token(qwen, 2),
                          2 * qwen.num_hidden_layers * qwen.num_key_value_heads
                          * qwen.head_dim * 2)
+
+    def test_kv_slot_shapes_are_asymmetric_for_mla(self):
+        # MLA 的两个 KV 槽不等宽: keys 是位置无关的潜向量, values 是带位置的 k_rot;
+        # 按 GQA 那样要求两槽同形, 会让 vLLM 后端的快照校验拒绝合法缓存
+        config = Glm4MoeLiteConfig(kv_lora_rank=512, qk_rope_head_dim=64)
+        self.assertEqual(kv_slot_shapes(config, 7),
+                         ((1, 1, 7, 512), (1, 1, 7, 64)))
+        qwen = Qwen3Config()
+        shape = (1, qwen.num_key_value_heads, 7, qwen.head_dim)
+        self.assertEqual(kv_slot_shapes(qwen, 7), (shape, shape))
 
 
 class ResolveLogitsKwargsTest(unittest.TestCase):

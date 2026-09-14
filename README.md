@@ -1,7 +1,8 @@
 # LMInfer
 
 现已支持实验性 `--backend vllm`：LMInfer 保留 agent KV 复用层，
-vLLM 执行单卡 dense Qwen3 的分段 prefill、KV 拼接、首尾重算和 decode。
+vLLM 执行单卡 dense Qwen3 与 MLA 模型（GLM-4.7-Flash）的分段 prefill、KV 拼接、
+首尾重算和 decode。
 启动方式、实现边界及真实 GPU 验收见 [vLLM 后端说明](docs/vllm_backend.md)。
 默认仍使用下文介绍的 Transformers 后端。
 
@@ -86,6 +87,14 @@ lminfer serve /home/tanger/workspace/models/GLM-4-9B-0414 \
 # 即 vLLM 的 glm45/glm47; MLA 注意力; 权重约 59 GiB, 单卡 80GB)
 lminfer serve /public/home/xiaoxunpeng/Models/GLM-4.7-Flash \
     --served-model-name GLM-4.7-Flash --max-model-len 40960 \
+    --reuse-agent-kv-append --graft-rope-rebase \
+    --repair-window-begin 0.1 --repair-window-end 0.1 \
+    --no-enable-thinking \
+    --enable-auto-tool-choice --port 8000
+
+# 同一个模型换 vLLM 后端(MLA 走 FLASH_ATTN_MLA; 显存预算必须给足 58 GiB 权重)
+CUDA_VISIBLE_DEVICES=5 lminfer serve /public/home/xiaoxunpeng/Models/GLM-4.7-Flash \
+    --backend vllm --gpu-memory-utilization 0.9 --max-model-len 40960 \
     --reuse-agent-kv-append --graft-rope-rebase \
     --repair-window-begin 0.1 --repair-window-end 0.1 \
     --no-enable-thinking \

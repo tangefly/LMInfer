@@ -373,6 +373,25 @@ def kv_bytes_per_token(config, dtype_size: int) -> int:
     return 2 * num_layers * num_kv_heads * head_dim * dtype_size
 
 
+def kv_slot_shapes(config, length: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """某个长度下 (keys 槽, values 槽) 的期望形状(不含 batch 以外的自由度).
+
+    普通 GQA/MHA 两个槽同形 `(1, KV头数, 长度, head_dim)`; MLA 的两槽**不等宽**
+    —— keys 是位置无关的压缩潜向量 `(1, 1, 长度, kv_lora_rank)`, values 是带位置
+    的 `k_rot` `(1, 1, 长度, qk_rope_head_dim)`, 这正是 transformers 后端与
+    vLLM 分页 cache 的公共约定(见 vllm_bridge 的模块说明)。
+    """
+    model_type = (str(getattr(config, "model_type", "") or "") if config is not None else "")
+    if model_type.lower() in MLA_MODEL_TYPES:
+        rank = int(getattr(config, "kv_lora_rank", 0) or 0)
+        rope = int(getattr(config, "qk_rope_head_dim", 0) or 0)
+        return (1, 1, length, rank), (1, 1, length, rope)
+    num_kv_heads = getattr(config, "num_key_value_heads", None) or config.num_attention_heads
+    head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+    shape = (1, num_kv_heads, length, head_dim)
+    return shape, shape
+
+
 # ---------------------------------------------------------------------------
 # 模型加载适配(transformers 后端)
 # ---------------------------------------------------------------------------

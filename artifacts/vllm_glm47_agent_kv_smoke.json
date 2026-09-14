@@ -1,0 +1,130 @@
+{
+  "model": "/public/home/xiaoxunpeng/Models/GLM-4.7-Flash",
+  "vllm_version": "0.27.1",
+  "transformers_version": "5.15.0",
+  "torch_version": "2.13.0+cu130",
+  "gpu": "NVIDIA H100 PCIe",
+  "checks": "passed",
+  "records": [
+    {
+      "case": "full",
+      "backend": "vllm",
+      "mode": "window",
+      "stages": 1,
+      "graft_tokens": 0,
+      "computed_prompt_tokens": 165,
+      "executed_tokens": 180,
+      "loaded_tokens": 0,
+      "cached_sequence_tokens": 180,
+      "truncated": false,
+      "exact": true,
+      "ttft_ms": 166.04156299581518
+    },
+    {
+      "case": "prefix",
+      "backend": "vllm",
+      "mode": "window",
+      "stages": 1,
+      "graft_tokens": 0,
+      "computed_prompt_tokens": 1,
+      "executed_tokens": 16,
+      "loaded_tokens": 164,
+      "cached_sequence_tokens": 180,
+      "truncated": false,
+      "exact": true,
+      "ttft_ms": 99.02450999652501
+    },
+    {
+      "case": "same_context_grafts",
+      "backend": "vllm",
+      "mode": "window",
+      "stages": 3,
+      "graft_tokens": 72,
+      "computed_prompt_tokens": 93,
+      "executed_tokens": 108,
+      "loaded_tokens": 199,
+      "cached_sequence_tokens": 180,
+      "truncated": false,
+      "exact": false,
+      "ttft_ms": 357.8155460054404
+    },
+    {
+      "case": "cross_context_graft",
+      "backend": "vllm",
+      "mode": "window",
+      "stages": 2,
+      "graft_tokens": 27,
+      "computed_prompt_tokens": 36,
+      "executed_tokens": 51,
+      "loaded_tokens": 44,
+      "cached_sequence_tokens": 78,
+      "truncated": false,
+      "exact": false,
+      "ttft_ms": 239.97554899688112,
+      "text": " Paris. (The report mentions \"Report: Here is a long list of facts"
+    },
+    {
+      "case": "exact_fallback",
+      "backend": "vllm",
+      "mode": "exact",
+      "stages": 1,
+      "graft_tokens": 0,
+      "computed_prompt_tokens": 63,
+      "executed_tokens": 78,
+      "loaded_tokens": 0,
+      "cached_sequence_tokens": 78,
+      "truncated": false,
+      "exact": true,
+      "ttft_ms": 117.26315999840153
+    },
+    {
+      "case": "chunked_prefix",
+      "backend": "vllm",
+      "mode": "window",
+      "stages": 1,
+      "graft_tokens": 0,
+      "computed_prompt_tokens": 70,
+      "executed_tokens": 85,
+      "loaded_tokens": 531,
+      "cached_sequence_tokens": 616,
+      "truncated": false,
+      "exact": true,
+      "ttft_ms": 169.8976629995741
+    },
+    {
+      "case": "sub_kv_freed_before_main_decode",
+      "checks": "passed",
+      "released_snapshot_bytes": 10179072
+    },
+    {
+      "case": "http_two_subagent_roundtrip",
+      "backend": "vllm",
+      "mode": "window",
+      "stages": 3,
+      "graft_tokens": 54,
+      "computed_prompt_tokens": 42,
+      "executed_tokens": 51,
+      "loaded_tokens": 172,
+      "cached_sequence_tokens": 125,
+      "truncated": false,
+      "exact": false
+    },
+    {
+      "case": "http_multiround_exact_boundary",
+      "backend": "vllm",
+      "mode": "window",
+      "stages": 1,
+      "graft_tokens": 0,
+      "computed_prompt_tokens": 107,
+      "executed_tokens": 108,
+      "loaded_tokens": 28,
+      "cached_sequence_tokens": 136,
+      "truncated": false,
+      "exact": true
+    },
+    {
+      "case": "http_stream_release_errors",
+      "checks": "passed"
+    }
+  ]
+}
