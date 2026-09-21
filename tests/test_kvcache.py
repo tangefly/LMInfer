@@ -109,6 +109,44 @@ class SessionKVStoreTest(unittest.TestCase):
         self.assertEqual([g.source_position for g in grafts], [1])
 
 
+    def test_build_grafts_multi_sub_outputs_in_one_merged_window(self):
+        # 批量委派: 客户端把两个 sub 的输出合并进同一条 tool 消息(如
+        # {"results": [r1, r2]}) -> 只有一个 <tool_response> 窗口。
+        # 两个 sub 的输出 KV 都应被拼接, 不能只拼一段。
+        store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
+        session_id = "s1"
+        main_tokens = [1, 2, 3]
+        self.assertTrue(store.put(session_id, KIND_MAIN, main_tokens, make_cache(3), prompt_len=3))
+
+        outputs = [[101, 102, 103, 104], [201, 202, 203, 204]]
+        for i, output in enumerate(outputs, start=1):
+            seq = [10 * i] + output
+            self.assertTrue(store.put(session_id, KIND_SUB, seq, make_cache(len(seq)), prompt_len=1))
+
+        # 一个窗口: 55/66 是两个 JSON 结果之间的分隔 token, 都不匹配 sub 输出
+        prompt = main_tokens + [900] + outputs[0] + [55, 66] + outputs[1] + [901]
+        grafts = store.build_grafts(session_id, [KIND_MAIN, "sub", "sub", KIND_MAIN], prompt)
+
+        self.assertEqual([g.tokens for g in grafts], outputs)
+        self.assertEqual([g.position for g in grafts], [4, 10])
+        self.assertEqual([g.source_position for g in grafts], [1, 1])
+
+    def test_build_grafts_overlapping_window_matches_prefer_longest(self):
+        # 同一窗口内两个 sub 候选抢同一段正文: 长匹配胜出, 短的让位 ——
+        # 重叠片段不能同时接受(引擎要求多段位置严格递增, 否则整批回退)
+        store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
+        self.assertTrue(store.put("s", KIND_MAIN, [1], make_cache(1), prompt_len=1))
+        short = [7] + [101, 102, 103, 104]
+        long_out = [8] + [201, 202, 101, 102, 103, 104, 105, 106]
+        self.assertTrue(store.put("s", KIND_SUB, short, make_cache(len(short)), prompt_len=1))
+        self.assertTrue(store.put("s", KIND_SUB, long_out, make_cache(len(long_out)), prompt_len=1))
+
+        prompt = [1, 900, 77, 101, 102, 103, 104, 105, 106, 901]
+        grafts = store.build_grafts("s", [KIND_MAIN, "sub", "sub", KIND_MAIN], prompt)
+
+        self.assertEqual([g.tokens for g in grafts], [[101, 102, 103, 104, 105, 106]])
+        self.assertEqual([g.position for g in grafts], [3])
+
     def test_sub_put_replaces_same_trace_invocation(self):
         store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
         session_id = "s1"

@@ -35,9 +35,11 @@ agent 模式下, 主 agent 调起子 agent, 子 agent 的输出会作为新消�
    序列逐位对齐(正文可能写在 think 块内/外, 见 SessionKVStore.build_grafts),
    把子 agent 请求时算好的输出 KV 直接插入 main 的 KV cache 对应位置 ——
    窗口外的包裹标记由引擎照常 prefill, 跳过的是正文这段的重复 prefill。
-   注意: 该 KV 在子 agent 自己的上下文里计算, 插入 main 上下文后注意力结果
-   与全量 prefill 存在**近似差异**(实验用途, 见 KVGraft/build_grafts);
-   定位失败时安全回退 LCP 模式。
+   多个 sub 输出被客户端合并进同一条 tool 消息(批量委派, 如
+   {"results": [r1, r2]})时只产生一个窗口: 窗口内按匹配长度降序接受各 sub 的
+   互不重叠片段, 一次拼接多个 sub 的输出 KV。注意: 该 KV 在子 agent 自己的
+   上下文里计算, 插入 main 上下文后注意力结果与全量 prefill 存在**近似差异**
+   (实验用途, 见 KVGraft/build_grafts); 定位失败时安全回退 LCP 模式。
 
 5. 复用段必须**深拷贝**(slice_cache/tail_cache)后交给生成循环: transformers 的
    DynamicCache.update 是原地拼接, 直接传会让后续请求污染已保存的缓存.
@@ -554,8 +556,9 @@ class SessionKVStore:
     ) -> KVGraft | None:
         """把一个 tool_response 窗口与一个 sub 输出对齐。
 
-        一个 sub agent 的最终输出 KV 作为一个整体候选处理: 每个窗口最多
-        产出一个连续 graft 片段。边界上不能匹配的 token 由引擎正常 prefill;
+        一个 sub agent 的最终输出 KV 作为一个整体候选处理: 每次调用最多
+        产出一个连续 graft 片段(一个窗口最终可接受多个不同 sub 的不重叠
+        片段, 见 build_grafts)。边界上不能匹配的 token 由引擎正常 prefill;
         不把同一个 sub 输出拆成多个 KV 片段。
         """
         sub_out = sub_seg.tokens[sub_seg.output_start:]
@@ -607,8 +610,11 @@ class SessionKVStore:
         (如 Qwen3 的 <tool_response>), 这层标记是 main prompt 相对子请求多出来
         的几个 token。窗口内不能与 sub 最终输出逐位匹配的边界 token 由引擎
         正常 prefill; 匹配到的最长连续正文片段则插入子请求时算好的 KV。每个
-        tool response 会向后寻找能匹配的 sub 输出; 同一次 sub invocation 的中间
-        KV 在保存时已被最新段覆盖。一个 sub 输出最多生成一个 graft 片段。
+        tool response 窗口会向后寻找能匹配的 sub 输出; 同一次 sub invocation
+        的中间 KV 在保存时已被最新段覆盖。一个 sub 输出最多生成一个 graft
+        片段; 多个 sub 输出合并进同一条 tool 消息(批量委派)时, 窗口内按匹配
+        长度降序接受互不重叠的片段, 重叠的短片段让位 —— 引擎要求多段位置严格
+        递增, 重叠插入会让整批 graft 校验失败回退 LCP。
 
         返回按 prompt 位置升序排列的 KVGraft 列表; 无 sub 段或定位失败时返回空列表.
         """
@@ -676,24 +682,38 @@ class SessionKVStore:
         matched_windows = 0
         sub_i = 0
         for win_idx, (body_start, _close_pos, window) in enumerate(windows, start=1):
-            best_match: KVGraft | None = None
-            best_i = -1
-            best_tokens = 0
+            # 每个剩余 sub 候选都在窗口里找自己的最长片段, 按匹配长度降序接受
+            # 互不重叠的片段(可多段): 批量委派会把多个 sub 输出合并进同一条
+            # tool 消息(如 {"results": [r1, r2]}), 一个窗口里就有多段正文。
+            # 与已接受片段重叠的短片段让位 —— 长匹配优先沿用"最终正文胜过
+            # 中间轮的顺带重合"的既有语义, 也保证多段位置严格递增。
+            candidates: list[tuple[int, KVGraft]] = []
             for match_i in range(sub_i, len(subs)):
                 candidate = self._match_graft_window(
                     session_id, subs[match_i], window, body_start)
-                candidate_tokens = len(candidate.tokens) if candidate is not None else 0
-                if candidate_tokens > best_tokens:
-                    best_match = candidate
-                    best_i = match_i
-                    best_tokens = candidate_tokens
-            if best_match is not None:
-                sub_i = best_i + 1
-                matched_windows += 1
-                grafts.append(best_match)
-                logger.info("会话 %s: 第 %d/%d 个 tool response 选择第 %d/%d 个 sub "
+                if candidate is not None:
+                    candidates.append((match_i, candidate))
+            candidates.sort(key=lambda item: len(item[1].tokens), reverse=True)
+            accepted: list[tuple[int, int]] = []  # 已接受片段的窗口区间 [start, end)
+            last_matched = -1
+            for match_i, candidate in candidates:
+                start = candidate.position - body_start
+                end = start + len(candidate.tokens)
+                if any(start < b and a < end for a, b in accepted):
+                    logger.info("会话 %s: 第 %d/%d 个 tool response 中第 %d/%d 个 sub "
+                                "候选与已接受片段重叠, 跳过(%d tok)", session_id,
+                                win_idx, len(windows), match_i + 1, len(subs),
+                                len(candidate.tokens))
+                    continue
+                accepted.append((start, end))
+                grafts.append(candidate)
+                last_matched = max(last_matched, match_i)
+                logger.info("会话 %s: 第 %d/%d 个 tool response 接受第 %d/%d 个 sub "
                             "候选, 匹配 %d tok", session_id, win_idx, len(windows),
-                            best_i + 1, len(subs), best_tokens)
+                            match_i + 1, len(subs), len(candidate.tokens))
+            if accepted:
+                sub_i = last_matched + 1
+                matched_windows += 1
             else:
                 logger.info("会话 %s: 第 %d/%d 个 tool response 未匹配到后续 sub "
                             "最终正文 KV, 跳过该窗口", session_id, win_idx, len(windows))
@@ -701,6 +721,7 @@ class SessionKVStore:
             logger.info("会话 %s: 共定位 %d/%d 个 tool response, 生成 %d 个 KV 片段"
                         "(候选 sub 段 %d 个), 准备多段拼接",
                         session_id, matched_windows, len(windows), len(grafts), len(subs))
+        grafts.sort(key=lambda g: g.position)
         return self._to_compute_device(grafts, attr="cache")
 
     def build_graft(self, session_id: str, trace: list[str],
