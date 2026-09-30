@@ -254,6 +254,27 @@ class SessionKVStoreTest(unittest.TestCase):
         self.assertEqual([g.position for g in grafts], [5])
         self.assertEqual([g.source_position for g in grafts], [3])
 
+    def test_build_grafts_later_window_body_beats_earlier_quote_fragments(self):
+        """批量复查场景: 候选正文逐字出现在后面的窗口, 早窗口(上一批 tool response)
+        里同文 quote 的碎片不允许把候选截胡, 否则正文所在窗口反而无候选可用。"""
+        store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
+        session_id = "s1"
+        main_saved = [1, 2, 3, 80, 81]
+        self.assertTrue(store.put(session_id, KIND_MAIN, main_saved, make_cache(len(main_saved)), prompt_len=5))
+        body = list(range(61, 77))  # 16 tok 候选正文
+        self.assertTrue(store.put(session_id, KIND_SUB, [5] + body, make_cache(len(body) + 1), prompt_len=1))
+
+        prompt = (
+            main_saved
+            + [900, 51, 52, 53, 54] + body[:4] + [901]  # 上一批结果: 只剩同文 quote 碎片(4 tok, 恰过最小匹配线)
+            + [900] + body + [901, 88]                  # 本批正文: 候选正文逐字在此
+        )
+        grafts = store.build_grafts(session_id, [KIND_MAIN, "sub", KIND_MAIN], prompt)
+
+        # 旧实现按窗口顺序贪心: 4 tok 碎片先被窗口1接受, 窗口2无候选可用
+        self.assertEqual([g.tokens for g in grafts], [body])
+        self.assertEqual([g.position for g in grafts], [16])  # 5(main) + 900 + 8(stale) + 901 + 900
+
     def test_new_main_clears_previous_sub_batch(self):
         store = SessionKVStore(config=None, tokenizer=FakeTokenizer())
         session_id = "s1"

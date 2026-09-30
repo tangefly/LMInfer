@@ -554,12 +554,13 @@ class SessionKVStore:
         window: list[int],
         body_start: int,
     ) -> KVGraft | None:
-        """把一个 tool_response 窗口与一个 sub 输出对齐。
+        """把一个 tool_response 窗口与一个 sub 输出对齐(纯定位, 不打日志)。
 
         一个 sub agent 的最终输出 KV 作为一个整体候选处理: 每次调用最多
         产出一个连续 graft 片段(一个窗口最终可接受多个不同 sub 的不重叠
         片段, 见 build_grafts)。边界上不能匹配的 token 由引擎正常 prefill;
-        不把同一个 sub 输出拆成多个 KV 片段。
+        不把同一个 sub 输出拆成多个 KV 片段。build_grafts 会对每个(候选,
+        窗口)组合调用本方法再全局指派, 是否接受与日志由指派结果统一决定。
         """
         sub_out = sub_seg.tokens[sub_seg.output_start:]
         if not sub_out:
@@ -587,8 +588,6 @@ class SessionKVStore:
                 if k > best_k:
                     best_k, best_i, best_j = k, i, j
         if best_k < GRAFT_MIN_MATCH:
-            logger.info("会话 %s: 未在窗口中定位到子 agent 输出正文, 放弃该窗口拼接",
-                        session_id)
             return None
 
         pos = body_start + best_i
@@ -596,9 +595,6 @@ class SessionKVStore:
         cache = slice_cache(
             tail_cache(sub_seg.cache, sub_seg.output_start + best_j, self._config),
             best_k, self._config)
-        logger.info("会话 %s: 定位子 agent 输出 KV 1 段/%d tok(窗口 %d tok, "
-                    "输出 %d tok, think_len %d), 准备插入",
-                    session_id, best_k, len(window), len(sub_out), sub_seg.think_len)
         return KVGraft(position=pos, tokens=tokens, cache=cache,
                        source_position=sub_seg.output_start + best_j)
 
@@ -609,12 +605,18 @@ class SessionKVStore:
         chat template 渲染 tool 消息时, 客户端回填的子输出正文前后带包裹标记
         (如 Qwen3 的 <tool_response>), 这层标记是 main prompt 相对子请求多出来
         的几个 token。窗口内不能与 sub 最终输出逐位匹配的边界 token 由引擎
-        正常 prefill; 匹配到的最长连续正文片段则插入子请求时算好的 KV。每个
-        tool response 窗口会向后寻找能匹配的 sub 输出; 同一次 sub invocation
-        的中间 KV 在保存时已被最新段覆盖。一个 sub 输出最多生成一个 graft
-        片段; 多个 sub 输出合并进同一条 tool 消息(批量委派)时, 窗口内按匹配
-        长度降序接受互不重叠的片段, 重叠的短片段让位 —— 引擎要求多段位置严格
-        递增, 重叠插入会让整批 graft 校验失败回退 LCP。
+        正常 prefill; 匹配到的最长连续正文片段则插入子请求时算好的 KV。同一次
+        sub invocation 的中间 KV 在保存时已被最新段覆盖。一个 sub 输出最多生成
+        一个 graft 片段; 多个 sub 输出合并进同一条 tool 消息(批量委派)时, 一个
+        窗口里有多段正文。
+
+        候选与窗口做全局指派而非按窗口顺序贪心消费: 候选的正文属于它真正逐字
+        出现的窗口, 历史 tool response(上一批结果)里同文的 quote 碎片不允许把
+        候选截胡, 否则正文所在的靠后窗口反而无候选可用。指派满足: 每个候选
+        至多一段、同窗口内片段互不重叠、指派窗口下标随候选顺序非降(tool
+        response 按 sub 返回顺序出现在 prompt 里), 总匹配 token 最大, 平手偏向
+        靠后窗口。引擎要求多段位置严格递增, 重叠插入会让整批 graft 校验失败
+        回退 LCP。
 
         返回按 prompt 位置升序排列的 KVGraft 列表; 无 sub 段或定位失败时返回空列表.
         """
@@ -678,51 +680,110 @@ class SessionKVStore:
                         _wrapper_label(self._wrapper))
             return []
 
+        # 先对每个(候选, 窗口)组合求最长匹配片段, 再做全局指派。按窗口顺序贪心
+        # 消费会让早窗口(历史批次 tool response)里的同文 quote 碎片把候选提前
+        # 消费掉, 候选正文真正所在的靠后窗口反而无候选可用 —— 批量委派+复查时
+        # 的常见形态。
+        frags: list[list[KVGraft | None]] = [
+            [self._match_graft_window(session_id, sub, window, body_start)
+             for body_start, _close_pos, window in windows]
+            for sub in subs
+        ]
+        assignment = self._assign_windows(frags, windows)
+        for cand_i, row in enumerate(frags):
+            hits = [(w, len(frag.tokens)) for w, frag in enumerate(row) if frag is not None]
+            if len(hits) > 1:
+                detail = ", ".join(f"窗口{w + 1}={tok}tok" for w, tok in hits)
+                logger.info("会话 %s: 第 %d/%d 个 sub 候选多窗口命中(%s) -> 指派窗口 %d",
+                            session_id, cand_i + 1, len(subs), detail, assignment[cand_i] + 1)
+            elif not hits:
+                logger.info("会话 %s: 第 %d/%d 个 sub 候选未在任何窗口定位到正文",
+                            session_id, cand_i + 1, len(subs))
         grafts: list[KVGraft] = []
         matched_windows = 0
-        sub_i = 0
-        for win_idx, (body_start, _close_pos, window) in enumerate(windows, start=1):
-            # 每个剩余 sub 候选都在窗口里找自己的最长片段, 按匹配长度降序接受
-            # 互不重叠的片段(可多段): 批量委派会把多个 sub 输出合并进同一条
-            # tool 消息(如 {"results": [r1, r2]}), 一个窗口里就有多段正文。
-            # 与已接受片段重叠的短片段让位 —— 长匹配优先沿用"最终正文胜过
-            # 中间轮的顺带重合"的既有语义, 也保证多段位置严格递增。
-            candidates: list[tuple[int, KVGraft]] = []
-            for match_i in range(sub_i, len(subs)):
-                candidate = self._match_graft_window(
-                    session_id, subs[match_i], window, body_start)
-                if candidate is not None:
-                    candidates.append((match_i, candidate))
-            candidates.sort(key=lambda item: len(item[1].tokens), reverse=True)
-            accepted: list[tuple[int, int]] = []  # 已接受片段的窗口区间 [start, end)
-            last_matched = -1
-            for match_i, candidate in candidates:
-                start = candidate.position - body_start
-                end = start + len(candidate.tokens)
-                if any(start < b and a < end for a, b in accepted):
-                    logger.info("会话 %s: 第 %d/%d 个 tool response 中第 %d/%d 个 sub "
-                                "候选与已接受片段重叠, 跳过(%d tok)", session_id,
-                                win_idx, len(windows), match_i + 1, len(subs),
-                                len(candidate.tokens))
-                    continue
-                accepted.append((start, end))
+        for win_idx in range(len(windows)):
+            accepted = [i for i, w in enumerate(assignment) if w == win_idx]
+            if not accepted:
+                logger.info("会话 %s: 第 %d/%d 个 tool response 未匹配到候选 sub "
+                            "正文, 跳过该窗口", session_id, win_idx + 1, len(windows))
+                continue
+            matched_windows += 1
+            for cand_i in accepted:
+                candidate = frags[cand_i][win_idx]
+                sub_seg = subs[cand_i]
                 grafts.append(candidate)
-                last_matched = max(last_matched, match_i)
                 logger.info("会话 %s: 第 %d/%d 个 tool response 接受第 %d/%d 个 sub "
-                            "候选, 匹配 %d tok", session_id, win_idx, len(windows),
-                            match_i + 1, len(subs), len(candidate.tokens))
-            if accepted:
-                sub_i = last_matched + 1
-                matched_windows += 1
-            else:
-                logger.info("会话 %s: 第 %d/%d 个 tool response 未匹配到后续 sub "
-                            "最终正文 KV, 跳过该窗口", session_id, win_idx, len(windows))
+                            "候选, 匹配 %d tok(输出 %d tok, think_len %d)",
+                            session_id, win_idx + 1, len(windows), cand_i + 1, len(subs),
+                            len(candidate.tokens), len(sub_seg.tokens) - sub_seg.output_start,
+                            sub_seg.think_len)
         if grafts:
             logger.info("会话 %s: 共定位 %d/%d 个 tool response, 生成 %d 个 KV 片段"
                         "(候选 sub 段 %d 个), 准备多段拼接",
                         session_id, matched_windows, len(windows), len(grafts), len(subs))
         grafts.sort(key=lambda g: g.position)
         return self._to_compute_device(grafts, attr="cache")
+
+    def _assign_windows(self, frags: list[list[KVGraft | None]],
+                        windows: list[tuple[int, int, list[int]]]) -> list[int]:
+        """候选 -> 窗口的全局指派, 返回每个候选的窗口下标(未指派为 -1)。
+
+        约束: 每个候选至多一个片段; 同窗口内片段互不重叠; 指派窗口下标随候选
+        顺序非降(tool response 按 sub 返回顺序出现在 prompt 里)。目标: 总匹配
+        token 最大; 平手偏向靠后窗口 —— 早窗口更可能是历史批次的残留。
+        候选/窗口规模很小(实际 <= 十几 x 几个), DFS 穷举并设节点预算,
+        预算耗尽时采用已找到的最优解。
+        """
+        count = len(frags)
+        window_count = len(windows)
+        assignment: list[int] = [-1] * count
+        if count == 0 or window_count == 0:
+            return assignment
+        best: dict = {"key": (-1, -1, -1), "assign": None}
+        budget = [200_000]
+        ranges: list[list[tuple[int, int]]] = [[] for _ in range(window_count)]
+
+        def solution_key(assign: list[int]) -> tuple[int, int, int]:
+            total = later = picked = 0
+            for i, w in enumerate(assign):
+                if w < 0:
+                    continue
+                total += len(frags[i][w].tokens)
+                later += w + 1
+                picked += 1
+            return (total, later, picked)
+
+        def dfs(i: int, w: int, assign: list[int]) -> None:
+            budget[0] -= 1
+            if i == count or w == window_count:
+                key = solution_key(assign)
+                if key > best["key"]:
+                    best["key"] = key
+                    best["assign"] = list(assign)
+                return
+            if budget[0] <= 0:
+                return
+            dfs(i, w + 1, assign)                       # 关闭当前窗口
+            dfs(i + 1, w, assign)                       # 跳过候选 i
+            for target in range(w, window_count):
+                frag = frags[i][target]
+                if frag is None:
+                    continue
+                start = frag.position - windows[target][0]
+                end = start + len(frag.tokens)
+                if any(start < b and a < end for a, b in ranges[target]):
+                    continue
+                ranges[target].append((start, end))
+                assign[i] = target
+                dfs(i + 1, target, assign)              # 后续候选从同一或更晚窗口指派
+                assign[i] = -1
+                ranges[target].pop()
+
+        dfs(0, 0, assignment)
+        if budget[0] <= 0:
+            logger.warning("build_grafts 指派搜索达到节点预算(%d 候选 x %d 窗口), 采用当前最优解",
+                           count, window_count)
+        return best["assign"] if best["assign"] is not None else [-1] * count
 
     def build_graft(self, session_id: str, trace: list[str],
                     prompt_tokens: list[int]) -> KVGraft | None:
